@@ -8,18 +8,54 @@ Implements the 5-term composite specified in `reports/design_rethinked.md` §4:
       + δ · L_VOL          ← MSE on log realized vol target (calibrate vol head)
       + η · L_GATE_BCE     ← BCE: gate vs. realized profitability (gate-vs-P&L supervision)
 
+Citation lineage
+----------------
+The differentiable Sharpe term L_SR_gated draws on:
+
+    Zhang, Z., Zohren, S. and Roberts, S. (2020). Deep Learning for
+    Portfolio Optimisation. J. Financial Data Science 2(4):8-20.
+    arXiv:2005.13665.
+
+Zhang-Zohren-Roberts (ZZR) train end-to-end on a portfolio Sharpe
+loss with softmax (long-only simplex) weights. Our v1 path
+(`use_xs_sharpe=False`) is a *per-sample correlate of portfolio
+Sharpe* — a tractable surrogate that propagates a Sharpe-direction
+gradient into the backbone but is NOT the Sharpe of any deployable
+portfolio (samples within a batch are shuffled across stocks/dates,
+so the per-sample mean/std does not equal the time-series mean/std
+of any cross-sectional portfolio's return). Our B1 path
+(`use_xs_sharpe=True`) constructs explicit synthetic cross-sections
+within each batch and applies the same long-short Kelly-style sizing
++ leg normalisation as the inference strategy — closer to ZZR's
+formulation but with a long-short generalisation (replace softmax
+with leg-wise normalised |tanh|).
+
+We deliberately do NOT cite Moody & Saffell (2001) "Learning to
+Trade via Direct Reinforcement" for L_SR_gated: their D_t is a
+per-period recursive estimator for online RL, fundamentally
+different from our batch-level surrogate.
+
 Two terms from the design (`λ_to·L_TURN`, `λ_dd·L_DD`) are NOT in v1 because:
   * Turnover requires temporally-ordered batches; our DataLoader shuffles. Adding
     turnover during training would require either disabling shuffle (hurts conv)
     or implementing a per-stock batch sampler. v2 work.
   * Drawdown per shuffled batch is meaningless for the same reason.
 Both penalties are correctly applied at *evaluation* time inside
-`Smoke_test/cross_sectional_smoke.py`'s portfolio-return cost model — the
+`smoke/cross_sectional_smoke.py`'s portfolio-return cost model — the
 training-time approximation is simply not necessary for the headline result
 provided the SR_gated term already pushes toward stable predictions.
 
 All operations work in **return space** (mean/std of H-step returns) so the
 loss is independent of stock price scale.
+
+Naming note
+-----------
+The position function `tanh(α·μ/σ)` is referred to as "Sharpe-saturated"
+or "soft-Sharpe-targeting" in the paper, NOT "Kelly-tanh". True
+continuous-time Kelly takes μ/σ² in the argument; using μ/σ implicitly
+penalises high-σ stocks more than Kelly would. Variable names retain
+the historical "kelly" prefix for code-search continuity but the
+externally-visible terminology is "Sharpe-saturated".
 """
 from __future__ import annotations
 
@@ -195,8 +231,12 @@ class CompositeRiskLoss(nn.Module):
         # ─── L_VOL: regress log realized vol ───
         L_VOL = ((log_vol_pred - log_vol_target) ** 2).mean()
 
-        # ─── Position (Kelly-scaled tanh) ───
-        # Saturates softly: small μ/σ → near-zero; large → ±1
+        # ─── Position (Sharpe-saturated tanh) ───
+        # Saturates softly: small μ/σ → near-zero; large → ±1.
+        # Argument is in Sharpe units (μ/σ), NOT Kelly units (μ/σ²) — see
+        # reports/methodology_audit_2026_05_07.md §J for derivation and
+        # justification of why μ/σ is more robust under a learned (noisy)
+        # σ estimator than the textbook Kelly μ/σ².
         position = torch.tanh(self.alpha_pos * mu_return_H / (sigma + self.eps_sigma))
 
         # ─── Gate: continuous, annealed-temperature ───
@@ -211,9 +251,11 @@ class CompositeRiskLoss(nn.Module):
             # B1 path: differentiable cross-sectional portfolio layer.
             # Partition the batch into K random "synthetic cross-sections".
             # In each, compute long-short normalized weights from
-            # (Kelly-tanh × gate) — same operation as the inference strategy
-            # — and form a portfolio return. Sharpe is mean / std across the
-            # K portfolio returns.
+            # (Sharpe-saturated tanh × gate) — same operation as the
+            # inference strategy — and form a portfolio return. Sharpe is
+            # mean / std across the K portfolio returns. This is closest to
+            # Zhang-Zohren-Roberts 2020 (arXiv:2005.13665) generalised to
+            # long-short with leg-wise L1 normalisation.
             B = mu_return_H.shape[0]
             K = max(2, min(self.xs_n_subgroups, B // 2))
             # Randomly assign each sample to a group; trim to be divisible.
@@ -225,7 +267,7 @@ class CompositeRiskLoss(nn.Module):
             gate_p = gate[perm].view(K, chunk)
             ret_p  = true_return_H[perm].view(K, chunk)
 
-            # Kelly-tanh raw weights, gated.  shape: [K, chunk]
+            # Sharpe-saturated tanh raw weights, gated.  shape: [K, chunk]
             raw = torch.tanh(self.alpha_pos * mu_p / (sig_p + self.eps_sigma)) * gate_p
 
             # Long-short leg normalisation (each leg's |weights| sum to 1

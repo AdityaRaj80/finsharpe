@@ -259,7 +259,13 @@ def cross_sectional_positions_risk_aware(
            kill-switch (see CompositeRiskLoss.forward: `gate * position *
            realised_return` is what's optimised).
         2. Rank survivors by `mu / sigma` (predicted Sharpe).
-        3. Assign Kelly-tanh raw weights `|tanh(alpha_pos * mu / sigma)|`.
+        3. Assign Sharpe-saturated raw weights `|tanh(alpha_pos * mu / sigma)|`.
+           NOTE: this is a "soft-Sharpe-targeting" position function, NOT
+           Kelly. True continuous-time Kelly takes mu/sigma^2 in the
+           argument; we use mu/sigma so the position depends on the
+           predicted Sharpe, which empirically yields more robust sizing
+           when sigma is itself a learned (and noisy) estimate. See
+           reports/methodology_audit_2026_05_07.md §J.
         4. Multiply weights by `gate[t,j]` — confident samples retain full
            weight, uncertain samples are scaled down. This is the
            training-time semantics applied at inference time.
@@ -288,8 +294,10 @@ def cross_sectional_positions_risk_aware(
         bot_idx = order[:top_n]
         top_idx = order[-top_n:]
 
-        # Kelly-style raw weights from |tanh(alpha*mu/sigma)|, then modulated
-        # by the (continuous) gate.
+        # Sharpe-saturated raw weights from |tanh(alpha*mu/sigma)|, then modulated
+        # by the (continuous) gate. (Variable names retain "kelly_" prefix for
+        # historical code-search continuity; the function is NOT Kelly — see
+        # reports/methodology_audit_2026_05_07.md §J.)
         kelly_long = np.abs(np.tanh(
             alpha_pos * mu_t[top_idx] / np.maximum(sig_t[top_idx], eps_sigma)))
         kelly_short = np.abs(np.tanh(
@@ -494,7 +502,15 @@ def cross_sectional_ic(pred_M, actu_M):
 
 
 # ─── Wrap up: full metric block per (config, cost) ──────────────────────────
+# Validity-of-inference threshold: with fewer than this many non-overlapping
+# rebalances, point Sharpe is reportable but bootstrap CI / NW t-stat is not
+# statistically valid. Carried into JSON output so downstream tables can flag.
+N_MIN_FOR_INFERENCE = 6
+
+
 def full_metric_block(returns, horizon, label=""):
+    r = np.asarray(returns, dtype=np.float64)
+    n_obs = int((~np.isnan(r)).sum())
     return {
         f"{label}sharpe": float(annualized_sharpe(returns, horizon)),
         f"{label}sortino": float(annualized_sortino(returns, horizon)),
@@ -503,6 +519,8 @@ def full_metric_block(returns, horizon, label=""):
         f"{label}cumulative_return": float(cumulative_return(returns)),
         f"{label}annualized_return": float(annualized_return(returns, horizon)),
         f"{label}hit_rate": float(hit_rate_portfolio(returns)),
+        f"{label}n_obs_nonoverlap": n_obs,
+        f"{label}inference_valid": bool(n_obs >= N_MIN_FOR_INFERENCE),
     }
 
 
@@ -749,6 +767,8 @@ def main():
             point_sharpes.append(sh)
     pointwise_median = float(np.median(point_sharpes)) if point_sharpes else float("nan")
 
+    n_test_t = int((~np.isnan(gross_nover)).sum())
+    inference_valid = bool(n_test_t >= N_MIN_FOR_INFERENCE)
     summary = {
         "model": args.model,
         "method": args.method,
@@ -760,7 +780,12 @@ def main():
         "gate_threshold": args.gate_threshold if args.strategy == "risk_aware" else None,
         "alpha_pos":     args.alpha_pos       if args.strategy == "risk_aware" else None,
         "best_top_n": best_n,
-        "n_test_timestamps": int((~np.isnan(gross_nover)).sum()),
+        "n_test_timestamps": n_test_t,
+        # Validity flag — see methodology audit §D, §K. False at H >= 60 with
+        # a 1-year test window. CI / NW-tstat reporting on this row should be
+        # suppressed downstream.
+        "inference_valid": inference_valid,
+        "n_min_for_inference": N_MIN_FOR_INFERENCE,
         "gross_metrics": full_metric_block(gross_nover, args.horizon, label="gross_"),
         "cost_sensitivity": cost_table,
         "cross_sectional_IC_mean": float(ic_mean),
@@ -770,6 +795,12 @@ def main():
         "naive_eqw_cumulative_return": float(cumulative_return(naive_eq_nover)),
         "pointwise_per_stock_sharpe_median": pointwise_median,
     }
+    if not inference_valid:
+        print(f"\n[WARNING] n_test_timestamps={n_test_t} < {N_MIN_FOR_INFERENCE} — "
+              f"point Sharpe is reported but CI / significance tests at this "
+              f"horizon are NOT statistically valid (see methodology audit "
+              f"§D, §K). Downstream tables should suppress CIs for this row.",
+              flush=True)
 
     print("\n========== ICAIF-COMPLIANT SUMMARY ==========", flush=True)
     print(json.dumps(summary, indent=2), flush=True)
