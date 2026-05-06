@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+.env
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/
+
+# Model checkpoints — too large for git (~30-100 MB each, ~800 MB total).
+# Authoritative copy: BITS HPC ~/finsharpe/checkpoints/
+# Local backup:       D:\Study\CIKM\finsharpe\checkpoints\
+# Do NOT commit *.pth (would bloat repo and break clones).
+checkpoints/*.pth
+checkpoints/**/*.pth
+
+# Cache and intermediate artefacts
+.cache/
+*.npy
+results/**/*.csv
+results/**/*.json
+!results/.gitkeep
+
+# Local logs / scratch
+logs/
+*.log
+extension_run.log
+
+# Stage-2 OOT data — paths only; the actual data lives in D:\Study\CIKM\DATA
+DATA/
+350_merged*/
+350_merged_v2/
+
+# Editor artefacts
+*.swp
+*.swo
+*~
