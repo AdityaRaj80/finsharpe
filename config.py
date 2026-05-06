@@ -3,12 +3,20 @@ import os
 # ─────────────────────────────────────────────────────────────────────────────
 # Paths
 # ─────────────────────────────────────────────────────────────────────────────
-if os.path.exists(r"D:\Study\CIKM\DATA\350_merged"):
-    DATA_DIR = r"D:\Study\CIKM\DATA\350_merged"
+# DATA_DIR points to the SENTIMENT-CORRECTED dataset 350_merged_v2 produced
+# by the fin-sent-optimized pipeline (see D:\Study\CIKM\fin-sent-optimized).
+# The original 350_merged/ is deprecated due to the uniform-0.5 sentiment
+# bug documented in reports/sentiment_audit.md.
+if os.path.exists(r"D:\Study\CIKM\fin-sent-optimized\data\350_merged_v2"):
+    DATA_DIR = r"D:\Study\CIKM\fin-sent-optimized\data\350_merged_v2"
     STOCK_LIST_FILE = r"D:\Study\CIKM\DATA\Stock_list.txt"
-else:
-    DATA_DIR = "/home/goyalpoonam/data/350_merged"
+elif os.path.exists("/home/goyalpoonam/data/350_merged_v2"):
+    DATA_DIR = "/home/goyalpoonam/data/350_merged_v2"
     STOCK_LIST_FILE = "/home/goyalpoonam/data/Stock_list.txt"
+else:
+    raise FileNotFoundError(
+        "350_merged_v2 not found at the expected local or HPC paths. "
+        "Run the fin-sent-optimized pipeline first (or copy 350_merged_v2 to HPC).")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_SAVE_DIR = os.path.join(BASE_DIR, "checkpoints")
