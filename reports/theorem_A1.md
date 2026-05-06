@@ -1,8 +1,27 @@
-# Theorem A1 — Variance-Decomposition Lower Bound on the Track B Sharpe Gap
+# Theorem A1 — Σ-Orthogonal-Projection Identity for the Track B Sharpe Gap
 
 **Status:** Derivation. Empirical verification deferred until B1 retrains land.
 **Companion:** §6.2 of `track_b_findings.md` (where Track B's edge is described mechanistically).
-**One-line statement:** The squared-Sharpe advantage of σ-aware Kelly sizing over equal-weight ranking equals the squared norm of the predicted-mean vector projected orthogonally to the σ²-volume direction in covariance-Mahalanobis geometry — which is zero iff μ_i ∝ σ_i² for all stocks (a degenerate case) and grows monotonically with cross-sectional heterogeneity of σ.
+**Novelty status (post-audit, see `reports/novelty_verification_2026_05_07.md`):**
+
+> The closed-form Lagrange-identity / Cauchy–Schwarz step underlying this result
+> is mathematical *folklore* — it is implicit in any standard mean-variance
+> textbook treatment (Markowitz 1952; the result `SR_K² = μ^⊤ Σ⁻¹ μ` is in
+> Hansen-Jagannathan 1991 and any portfolio-theory text). Our contribution is
+> NOT the math itself but **the projection-identity packaging**
+> `‖P_{u^⊥} Σ^{−½} μ‖²`, the three corollaries A1-1 / A1-2 / A1-3, and the
+> empirical use of the identity as a *regime-of-edge predictor* tied to
+> ML-based σ-prediction quality. Reviewers familiar with DeMiguel-Garlappi-Uppal
+> 2009, Tu-Zhou 2011, or Kan-Zhou 2007 will recognise the underlying algebra
+> instantly; the paper claims novelty only for the framing and its operational
+> use, not for the identity per se.
+
+**One-line statement:** Under diagonal Σ, the squared-Sharpe advantage of
+σ-aware (Kelly-under-independence) sizing over equal-weight ranking equals the
+squared norm of the predicted-mean vector projected orthogonally to the
+σ²-volume direction in Σ-Mahalanobis geometry — zero iff μ_i ∝ σ_i² for all
+stocks (a degenerate case) and growing monotonically with cross-sectional
+heterogeneity of σ.
 
 ---
 
@@ -81,7 +100,7 @@ where P_{u^⊥} is the orthogonal projection onto the subspace perpendicular to 
 
 ---
 
-## 4. Theorem A1 (statement)
+## 4. Theorem A1 (statement — folkloric identity, our packaging)
 
 > **Theorem A1 (Σ-orthogonal-projection identity).** Let μ ∈ ℝ^N and Σ = diag(σ_1², …, σ_N²) with σ_i > 0. Then
 >
@@ -94,6 +113,22 @@ where P_{u^⊥} is the orthogonal projection onto the subspace perpendicular to 
 > with equality iff μ is in the direction of Σ · 𝟙, i.e. iff μ_i ∝ σ_i² for all i (in which case w_K = w_EW automatically).
 
 **Proof.** Section 3 above. The non-negativity is the Cauchy-Schwarz inequality `(𝟙^⊤ μ)² ≤ (𝟙^⊤ Σ 𝟙)(μ^⊤ Σ⁻¹ μ)` applied with vectors `Σ^{½} 𝟙` and `Σ^{−½} μ`; equality iff the two are linearly dependent, i.e. Σ^{−½} μ ∝ Σ^{½} 𝟙, i.e. μ ∝ Σ 𝟙.  ∎
+
+**Novelty disclosure.** Cauchy-Schwarz on the vectors `Σ^{½} 𝟙` and
+`Σ^{−½} μ` is a textbook step; the resulting closed-form gap
+`μ^⊤ Σ⁻¹ μ − (𝟙^⊤ μ)² / (𝟙^⊤ Σ 𝟙)` is folkloric and follows from any
+standard derivation of the unconstrained mean-variance frontier
+(Markowitz 1952; Hansen-Jagannathan 1991). The contributions of this
+note are: (a) the *projection-identity form* `‖P_{u^⊥} Σ^{−½} μ‖²`,
+(b) the three corollaries §5.1, §5.2, and §6, and (c) the operational
+linkage in §7 connecting `bar_CV_σ(H)` to `ΔSR(H)`, which we use as a
+diagnostic for whether a trained σ-head has converged to a regime
+where Track B should beat the MSE baseline. Items (a)-(c) are, to our
+knowledge, not previously stated in the financial-ML literature
+(verified against Markowitz 1952, Stevens 1998, Britten-Jones 1999,
+DeMiguel-Garlappi-Uppal 2009, Tu-Zhou 2011, Kan-Zhou 2007,
+Maillard-Roncalli-Teiletche 2010 — see
+`reports/novelty_verification_2026_05_07.md` for the audit trail).
 
 ---
 
@@ -189,11 +224,113 @@ That's a real architectural primitive justified by a real (if small) theorem. Th
 
 ## References
 
-The Markowitz mean-variance optimum and the resulting closed-form Kelly weights `w ∝ Σ⁻¹ μ` are classical (Markowitz 1952; Sharpe 1964). The result `SR_K² = μ^⊤ Σ⁻¹ μ` for the unconstrained optimum appears in standard portfolio textbooks. The orthogonal-projection identity in §3 is folklore but the explicit framing as `‖P_{u^⊥} Σ^{−½} μ‖²` and the corresponding empirical predictions A1-1 / A1-2 / A1-3 are, to our knowledge, novel in the financial-ML setting.
+### Mathematical lineage (folkloric — none of these state Theorem A1 in the form (*))
 
-The differentiable-portfolio-layer lineage to which B1 belongs traces through:
+* **Markowitz, H. (1952).** Portfolio Selection. *Journal of Finance* 7(1):77-91.
+  Gives the tangency portfolio `w_K ∝ Σ⁻¹μ` and `SR_K² = μ^⊤ Σ⁻¹ μ`. Does not
+  benchmark against equal-weight nor state the gap.
 
-* Amos & Kolter (2017). *OptNet: Differentiable Optimization as a Layer in Neural Networks*. ICML.
-* Butler & Kwon (2021). *Integrating Prediction in Mean-Variance Portfolio Optimization*. arXiv 2102.09287 / Quantitative Finance.
+* **Sharpe, W.F. (1964).** Capital Asset Prices. *Journal of Finance*
+  19(3):425-442. Single-factor decomposition of returns.
 
-Both treat the Markowitz quadratic program as a differentiable layer; neither combines it with a learned heteroscedastic σ head and a continuous gate kill-switch trained under a multi-term composite loss. B1 is the first such combination we are aware of in the time-series-forecasting context.
+* **Hansen, L.P. and Jagannathan, R. (1991).** Implications of Security Market
+  Data for Models of Dynamic Economies. *Journal of Political Economy*
+  99(2):225-262. Bounds the SDF variance by the squared Sharpe of any
+  portfolio. Closely related to `SR_K² = μ^⊤Σ⁻¹μ` in SDF framing; no 1/N gap.
+
+* **Stevens, G.V.G. (1998).** On the Inverse of the Covariance Matrix in
+  Portfolio Analysis. *Journal of Finance* 53(5):1821-1827.
+  doi:10.1111/0022-1082.00074. Regression interpretation of `Σ⁻¹`. No 1/N gap.
+
+* **Britten-Jones, M. (1999).** The Sampling Error in Estimates of Mean-Variance
+  Efficient Portfolio Weights. *Journal of Finance* 54(2):655-671.
+  doi:10.1111/0022-1082.00120. Squared-Sharpe as likelihood object; no
+  1/N benchmark.
+
+### Closest empirical 1/N-vs-MV literature (the *natural* prior art for the gap)
+
+* **DeMiguel, V., Garlappi, L. and Uppal, R. (2009).** Optimal Versus Naive
+  Diversification: How Inefficient is the 1/N Portfolio Strategy? *Review of
+  Financial Studies* 22(5):1915-1953. doi:10.1093/rfs/hhm075. Empirical
+  Sharpe gap; analytical estimation-window threshold for when MV beats 1/N
+  out-of-sample. The *oracle* (in-sample) gap formula
+  `μ^⊤ Σ⁻¹ μ − (𝟙^⊤ μ)² / (𝟙^⊤ Σ 𝟙)` is **not** stated.
+
+* **Tu, J. and Zhou, G. (2011).** Markowitz Meets Talmud: A Combination of
+  Sophisticated and Naive Diversification. *Journal of Financial Economics*
+  99(1):204-215. Uses expected squared SR as a single object; no
+  projection-identity decomposition.
+
+* **Kan, R. and Zhou, G. (2007).** Optimal Portfolio Choice with Parameter
+  Uncertainty. *JFQA* 42(3):621-656. doi:10.1017/S0022109000004129.
+  Distributional results for squared SR; three-fund rule.
+
+* **Maillard, S., Roncalli, T. and Teiletche, J. (2010).** The Properties of
+  Equally-Weighted Risk Contributions Portfolios. *Journal of Portfolio
+  Management* 36(4):60-70. Risk-parity / ERC; out of scope as direct prior
+  art for the SR-gap identity.
+
+### Adjacent geometric framings
+
+* **MDPI Engineering Proceedings 39(1):34 (2023).** Forecasting Tangency
+  Portfolios and Investing in the Minimum Euclidean Distance Portfolio.
+  Decomposes the *u-coefficient* of the efficient frontier as
+  `√(r^⊤V⁻¹r) · g(cos(r, 𝟙))`. Structurally adjacent (isolates a
+  Mahalanobis norm + similarity-to-ones factor) but addresses a different
+  quantity than the SR_K² − SR_EW² gap.
+
+* **Pav, S.E. (2024).** Notes on the Sharpe Ratio. CRAN SharpeR vignette;
+  also *The Sharpe Ratio: Statistics and Applications* (CRC Press, 2021).
+  Treats `n μ^⊤ Σ⁻¹ μ` as Hotelling's T². 1/N gap and projection form (*)
+  are not stated.
+
+### Differentiable-portfolio-layer lineage (for the B1 architecture in §6)
+
+* **Amos, B. and Kolter, J.Z. (2017).** OptNet: Differentiable Optimization
+  as a Layer in Neural Networks. *ICML 2017.* arxiv:1703.00443.
+
+* **Butler, J. and Kwon, R.H. (2021).** Integrating Prediction in
+  Mean-Variance Portfolio Optimization. *Quantitative Finance.*
+  arxiv:2102.09287.
+
+* **Zhang, Z., Zohren, S. and Roberts, S. (2020).** Deep Learning for
+  Portfolio Optimisation. *Journal of Financial Data Science* 2(4):8-20.
+  arxiv:2005.13665. Direct end-to-end Sharpe loss with softmax weights.
+
+Amos-Kolter and Butler-Kwon treat the Markowitz quadratic program as a
+differentiable layer; neither combines it with a learned heteroscedastic
+σ head and a profitability-supervised gate trained under a multi-term
+composite loss. ZZR 2020 trains a Sharpe loss directly but with softmax
+(long-only simplex) weights and no heteroscedastic uncertainty head. The
+combination implemented in B1 (long-short Sharpe-saturated sizing +
+σ-aware gate + composite loss) is a long-short generalisation of ZZR
+co-supervised by per-trade meta-labels.
+
+### Meta-labeling lineage (for the L_GATE_BCE term in `engine/losses.py`)
+
+* **López de Prado, M. (2018).** *Advances in Financial Machine Learning.*
+  Wiley. Chapter 3 §3.6 ("Meta-Labeling," pp. 50-51). Defines the
+  binary `1{trade was profitable}` label that supervises L_GATE_BCE.
+  Architectural difference: López de Prado trains a *secondary*
+  classifier sequentially (typically RF / GBM); we fold the same
+  supervisory signal into the primary network as a sigmoid×sigmoid gate
+  trained jointly with the μ-σ-vol heads.
+
+* **Joubert, J. (2022).** Meta-Labeling: Theory and Framework.
+  SSRN 4032018. Formal framework for meta-labeling and ensemble
+  variants. Same architectural decoupling as López de Prado.
+
+* **Singh, A. and Joubert, J. (2022).** Does Meta-Labeling Add to Signal
+  Efficacy? Triple Barrier Method. *Journal of Financial Data Science*
+  4(3). Empirical Sharpe-improvement results from meta-label filtering.
+
+### Audit trail
+
+The novelty claims of this note (projection framing in §3-§4; corollaries
+§5.1, §5.2; α-regime classification in §6; bar_CV_σ-vs-ΔSR predictions
+in §7) were checked against the references above, plus a broader
+keyword search on Google Scholar / arXiv for "squared Sharpe gap
+variance decomposition", "cross-sectional Sharpe heterogeneity",
+"Mahalanobis projection portfolio Sharpe", in
+`reports/novelty_verification_2026_05_07.md`. Verdict: 🟡 NOVEL FRAMING
+(the math is folklore; the framing and operational use are new).

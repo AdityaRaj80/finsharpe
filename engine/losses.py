@@ -25,15 +25,46 @@ portfolio (samples within a batch are shuffled across stocks/dates,
 so the per-sample mean/std does not equal the time-series mean/std
 of any cross-sectional portfolio's return). Our B1 path
 (`use_xs_sharpe=True`) constructs explicit synthetic cross-sections
-within each batch and applies the same long-short Kelly-style sizing
-+ leg normalisation as the inference strategy — closer to ZZR's
-formulation but with a long-short generalisation (replace softmax
-with leg-wise normalised |tanh|).
+within each batch and applies the same long-short Sharpe-saturated
+sizing + leg normalisation as the inference strategy — closer to
+ZZR's formulation but with a long-short generalisation (replace
+softmax with leg-wise normalised |tanh|).
 
 We deliberately do NOT cite Moody & Saffell (2001) "Learning to
 Trade via Direct Reinforcement" for L_SR_gated: their D_t is a
 per-period recursive estimator for online RL, fundamentally
 different from our batch-level surrogate.
+
+The L_GATE_BCE term — supervising a confidence gate via binary
+cross-entropy against the realised P&L sign `1{position * return > 0}`
+— is a *neural-network-internal end-to-end-trained variant of
+meta-labeling*:
+
+    López de Prado, M. (2018). Advances in Financial Machine
+    Learning. Wiley. Chapter 3 §3.6 ("Meta-Labeling," pp. 50-51).
+
+López de Prado's meta-labeling defines exactly the same supervisory
+signal — a binary `1{trade was profitable}` label, derived from the
+triple-barrier method or, in our setting, directly from
+sign(position * realised_return) — and trains a *secondary*
+classifier on it (typically a random forest / gradient boosting
+ensemble). Our distinguishing aspects are:
+  (i) the gate is INTERNAL to the forecasting network and trained
+      JOINTLY with the heteroscedastic μ-σ-vol heads via a single
+      back-propagation pass (vs. meta-labeling's sequential
+      two-stage pipeline);
+  (ii) the gate is structurally a product of sigmoids over the
+      network's OWN uncertainty estimates `(log_sigma2_H,
+      log_vol_pred)`, which makes it interpretable as a learned
+      dual-threshold uncertainty filter rather than an opaque
+      downstream scorer;
+  (iii) the temperature T anneals from 1.0 → 0.13 over training,
+      bridging the soft-attention regime (early epochs) and the
+      near-binary kill-switch regime (late epochs).
+
+The combination (i)+(ii)+(iii) is, to our knowledge, new. The
+underlying *idea* of profitability-supervised position sizing is a
+2018 contribution by López de Prado, which we cite and extend.
 
 Two terms from the design (`λ_to·L_TURN`, `λ_dd·L_DD`) are NOT in v1 because:
   * Turnover requires temporally-ordered batches; our DataLoader shuffles. Adding
@@ -295,6 +326,13 @@ class CompositeRiskLoss(nn.Module):
             L_SR_gated = -(sr_mean / sr_std)
 
         # ─── L_GATE_BCE: gate should match realized profitability ───
+        # Supervisory signal: profitable = 1{position * realised_return > 0}.
+        # This is the same per-trade binary label used by López de Prado's
+        # meta-labeling (López de Prado 2018, Advances in Financial Machine
+        # Learning, Wiley, Ch. 3 §3.6, pp. 50-51) — there it is the target of
+        # a sequentially-trained secondary classifier; here it supervises an
+        # internal sigmoid×sigmoid gate end-to-end, with T-annealing.
+        #
         # We compute BCE manually (mathematically identical to
         # `F.binary_cross_entropy(gate, target)`) because the fused PyTorch
         # kernel is autocast-unsafe under bf16/fp16: it raises
