@@ -110,10 +110,12 @@ def paired_bootstrap_per_cell(fold: str, cost_bps: int = 20,
         if n < 6:
             continue
         a, b = rh_ts[:n], mse_ts[:n]    # A = riskhead, B = mse
-        # Parse model + horizon
+        # Parse "<model>_H<horizon>_<fold>"
         parts = base.split("_H")
         model = parts[0]
-        horizon = int(parts[1])
+        # parts[1] looks like "20_F4" -- take the leading digits
+        horizon_str = parts[1].split("_")[0]
+        horizon = int(horizon_str)
 
         # Block length
         eb = max(2.0, (politis_white_block_length(a) + politis_white_block_length(b)) / 2)
