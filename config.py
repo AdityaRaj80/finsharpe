@@ -65,7 +65,27 @@ def load_universe(file_path: str = None) -> list[str]:
 # Common training config
 # ─────────────────────────────────────────────────────────────────────────────
 SEQ_LEN = 504           # 2 trading years look-back (ratio >= 2x for all horizons)
-HORIZONS = [5, 20, 60]   # PLAN_v2: dropped {120, 240} -- bootstrap CIs invalid at H>=120
+# All five horizons retained for the benchmark (PLAN_v2 §7 amended).
+# At long horizons, single-fold bootstrap CIs are weak (n<6 at H>=120),
+# but the 4-fold walk-forward aggregate gives n=8 at H=120 and n=4 at
+# H=240 -- borderline statistical validity reported with explicit
+# caveats. We do NOT cherry-pick horizons; we disclose the validity
+# tier of each. See reports/PLAN_v2_2026_05_07.md.
+HORIZONS = [5, 20, 60, 120, 240]
+
+# Per-horizon CI validity tier (used by cross_sectional_smoke.py +
+# bootstrap_paired.py to decide what to report):
+#   "full"      -- single-fold bootstrap CIs valid + aggregate strong
+#   "aggregate" -- single-fold CIs weak; aggregate-across-folds strong
+#   "point"     -- aggregate CI borderline; report point estimates,
+#                  no CI, with explicit "n too small" footnote
+HORIZON_CI_TIER = {
+    5:   "full",
+    20:  "full",
+    60:  "aggregate",
+    120: "point",
+    240: "point",
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Calendar split (PLAN_v2 headline fold F4)
