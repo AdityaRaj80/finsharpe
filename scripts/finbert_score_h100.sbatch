@@ -28,11 +28,9 @@ HF_CACHE="$HOME/.cache/huggingface"
 
 cd "$REPO_DIR"
 
-# Activate env (assumes conda env 'finsharpe' has torch+transformers; adjust if not)
-if [ -d "$HOME/miniconda3" ]; then
-    source "$HOME/miniconda3/etc/profile.d/conda.sh"
-    conda activate finsharpe || conda activate base
-fi
+# Activate env (sr_opt: torch 2.11+cu130, transformers 5.8 — verified working)
+source /apps/spack/opt/spack/linux-rocky8-zen2/gcc-11.2.0/anaconda3-2023.09-0-ku6kdpolxwbdydg5xyawasvogquyjj4b/etc/profile.d/conda.sh
+conda activate sr_opt
 
 # Pre-fetch the model so the worker node doesn't hit the network mid-job
 python -c "
