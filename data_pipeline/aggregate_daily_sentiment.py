@@ -34,8 +34,8 @@ import sys
 import numpy as np
 import pandas as pd
 
-DEFAULT_IN = r"D:\Study\CIKM\DATA\finbert_scores"
-DEFAULT_OUT = r"D:\Study\CIKM\DATA\finbert_daily"
+DEFAULT_IN = r"D:\Study\CIKM\fin-sent-optimized\data\finbert_scores_v2"
+DEFAULT_OUT = r"D:\Study\CIKM\fin-sent-optimized\data\finbert_daily_v2"
 
 
 def aggregate_one(in_path: str, out_path: str) -> dict:

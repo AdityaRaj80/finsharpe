@@ -32,8 +32,8 @@ import sys
 import numpy as np
 import pandas as pd
 
-DEFAULT_PER_ARTICLE_DIR = r"D:\Study\CIKM\DATA\finbert_scores"
-DEFAULT_PER_STOCK_DIR   = r"D:\Study\CIKM\DATA\350_merged_v2"
+DEFAULT_PER_ARTICLE_DIR = r"D:\Study\CIKM\fin-sent-optimized\data\finbert_scores_v2"
+DEFAULT_PER_STOCK_DIR   = r"D:\Study\CIKM\fin-sent-optimized\data\merged_v3"
 DEFAULT_CACHE_DIR       = r"D:\Study\CIKM\finsharpe\.cache\global_scaled"
 
 

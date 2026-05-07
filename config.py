@@ -1,32 +1,29 @@
 import os
+import pandas as pd
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Paths
+# Paths (PLAN_v2 — see reports/PLAN_v2_2026_05_07.md)
 # ─────────────────────────────────────────────────────────────────────────────
-# DATA_DIR points to the SENTIMENT-CORRECTED dataset 350_merged_v2 produced
-# by the fin-sent-optimized pipeline (see D:\Study\CIKM\fin-sent-optimized).
-# The original 350_merged/ is deprecated due to the uniform-0.5 sentiment
-# bug documented in reports/sentiment_audit.md.
-if os.path.exists(r"D:\Study\CIKM\fin-sent-optimized\data\350_merged_v2"):
-    DATA_DIR = r"D:\Study\CIKM\fin-sent-optimized\data\350_merged_v2"
-    STOCK_LIST_FILE = r"D:\Study\CIKM\DATA\Stock_list.txt"
-elif os.path.exists("/home/goyalpoonam/data/350_merged_v2"):
-    DATA_DIR = "/home/goyalpoonam/data/350_merged_v2"
-    STOCK_LIST_FILE = "/home/goyalpoonam/data/Stock_list.txt"
+# DATA_DIR points to the v2 merged dataset produced by:
+#   1. data_pipeline/finbert_score_hpc.py     (FinBERT on the 23 GB FNSPID file)
+#   2. data_pipeline/aggregate_daily_sentiment.py
+#   3. data_pipeline/rebuild_merged_v2.py
+#
+# Local + HPC fallback paths.
+if os.path.exists(r"D:\Study\CIKM\fin-sent-optimized\data\merged_v3"):
+    DATA_DIR = r"D:\Study\CIKM\fin-sent-optimized\data\merged_v3"
+elif os.path.exists("/home/goyalpoonam/data/merged_v3"):
+    DATA_DIR = "/home/goyalpoonam/data/merged_v3"
 else:
-    raise FileNotFoundError(
-        "350_merged_v2 not found at the expected local or HPC paths. "
-        "Run the fin-sent-optimized pipeline first (or copy 350_merged_v2 to HPC).")
+    DATA_DIR = None    # Set later by pipelines that don't need merged data yet
+                       # (e.g., the FinBERT scoring step itself).
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_SAVE_DIR = os.path.join(BASE_DIR, "checkpoints")
 RESULTS_DIR = os.path.join(BASE_DIR, "results")
 # Pre-scaled per-stock .npy cache for the memory-mapped global loader.
-# Contents are ~3 GB and regenerable from raw CSVs, so this dir is in .gitignore.
+# Contents are regenerable from raw CSVs, so this dir is in .gitignore.
 CACHE_DIR = os.path.join(BASE_DIR, ".cache", "global_scaled")
-# Pre-scaled val/test per-stock cache. Each entry is split half/half: val
-# is fit_transform on the first half, test is transform on the second
-# half using val's scaler (zero-leakage convention).
 VALTEST_CACHE_DIR = os.path.join(BASE_DIR, ".cache", "valtest_scaled")
 
 os.makedirs(MODEL_SAVE_DIR, exist_ok=True)
@@ -40,35 +37,52 @@ os.makedirs(VALTEST_CACHE_DIR, exist_ok=True)
 FEATURES = ["Open", "High", "Low", "Close", "Volume", "scaled_sentiment"]
 CLOSE_IDX = 3  # Index of Close in FEATURES array
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Train / Eval stock splits
-# ─────────────────────────────────────────────────────────────────────────────
-# The 50 stocks for evaluation (Validation and Test)
-NAMES_50 = [
-    "aal", "AAPL", "ABBV", "AMD", "amgn", "AMZN", "BABA", "bhp", "bidu", "biib", 
-    "C", "cat", "cmcsa", "cmg", "cop", "COST", "crm", "CVX", "dal", "DIS", "ebay", 
-    "GE", "gild", "gld", "GOOG", "gsk", "INTC", "KO", "mrk", "MSFT", "mu", "nke", 
-    "nvda", "orcl", "pep", "pypl", "qcom", "QQQ", "SBUX", "T", "tgt", "tm", "TSLA", 
-    "TSM", "uso", "v", "WFC", "WMT", "xlf",
-]
+# Target reformulation (PLAN_v2): predict log-returns directly, NOT
+# MinMax-scaled prices. This makes our MSE comparable to PatchTST,
+# iTransformer, MASTER, and the 2024 cross-sectional ranking literature.
+TARGET_MODE = "log_return"   # {"log_return", "scaled_price"}; default v2 = log_return
 
-# We will treat all stocks *not* in NAMES_50 as the training group (~300 of them).
+# Stock-split convention (PLAN_v2): use the SAME 300-stock universe across
+# train/val/test, calendar-only split. Matches MASTER/DeepClair/Qlib.
+STOCK_SPLIT_MODE = "calendar_only"   # {"calendar_only", "disjoint_stocks"}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stock universe (PLAN_v2 — 300 stocks, curated 2026-05-07)
+# ─────────────────────────────────────────────────────────────────────────────
+UNIVERSE_FILE = os.path.join(BASE_DIR, "data", "universe_main.csv")
+SEQVSGLOB_UNIVERSE_FILE = os.path.join(BASE_DIR, "data", "universe_seqvsglob.csv")
+
+
+def load_universe(file_path: str = None) -> list[str]:
+    """Return the list of UPPERCASE tickers in the universe."""
+    p = file_path or UNIVERSE_FILE
+    if not os.path.exists(p):
+        raise FileNotFoundError(f"Universe file not found: {p}")
+    return list(pd.read_csv(p)["ticker"].astype(str).str.upper())
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Common training config
 # ─────────────────────────────────────────────────────────────────────────────
 SEQ_LEN = 504           # 2 trading years look-back (ratio >= 2x for all horizons)
-HORIZONS = [5, 20, 60, 120, 240]
+HORIZONS = [5, 20, 60]   # PLAN_v2: dropped {120, 240} -- bootstrap CIs invalid at H>=120
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Calendar-date split for val/test (FIXES the per-stock 50/50 mismatched
-# windows bug — every test stock now shares an identical val/test calendar
-# window, so cross-sectional ranking compares apples-to-apples dates).
+# Calendar split (PLAN_v2 headline fold F4)
 # ─────────────────────────────────────────────────────────────────────────────
-VAL_START_DATE  = "2022-01-01"  # val window: VAL_START <= date < TEST_START
-TEST_START_DATE = "2023-01-01"  # test window: date >= TEST_START
-# (everything before VAL_START_DATE is unused for evaluation; it is reserved
-# either for the held-out training pool or for the held-out stocks' early
-# history that the model never sees.)
+TRAIN_END_DATE  = "2021-12-31"
+VAL_START_DATE  = "2022-01-01"
+VAL_END_DATE    = "2022-12-31"
+TEST_START_DATE = "2023-01-01"
+TEST_END_DATE   = "2023-12-29"   # FNSPID effective price-data end
+
+# Walk-forward CV folds (PLAN_v2 §4)
+WALK_FORWARD_FOLDS = [
+    {"name": "F1", "train_end": "2018-12-31", "val_year": 2019, "test_year": 2020},
+    {"name": "F2", "train_end": "2019-12-31", "val_year": 2020, "test_year": 2021},
+    {"name": "F3", "train_end": "2020-12-31", "val_year": 2021, "test_year": 2022},
+    {"name": "F4", "train_end": "2021-12-31", "val_year": 2022, "test_year": 2023},
+]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Pre-defined Hyperparameters for each model
