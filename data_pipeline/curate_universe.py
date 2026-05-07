@@ -61,15 +61,20 @@ OUT_DIR = r"D:\Study\CIKM\fin-sent-optimized\data"
 # -----------------------------------------------------------------------------
 PRICE_START = "2009-01-01"
 PRICE_END   = "2023-12-29"           # FNSPID's effective price end
-VAL_YEAR    = 2022
-TEST_YEAR   = 2023
-TRAIN_END   = "2021-12-31"
+
+# Time-leakage-free selection years (Jury 1 fix item B1+B3, 2026-05-07).
+# The universe must be selectable using ONLY pre-fold-train-end information.
+# F1's train ends 2018-12-31, so we cannot use any 2019+ data. We use
+# 2017+2018 news counts and 2017 dollar-volume as the selection criteria.
+SELECTION_YEAR_A = 2017               # first news-year requirement
+SELECTION_YEAR_B = 2018               # second news-year requirement
+LIQUIDITY_YEAR   = 2017               # median dollar-volume year
 
 # Coverage thresholds
-N_NEWS_VAL_MIN  = 30                  # >=30 news articles in VAL year
-N_NEWS_TEST_MIN = 30                  # >=30 news articles in TEST year
-MIN_DOLLAR_VOL  = 5_000_000           # median daily $ volume in TEST year
-MAX_GAP_DAYS    = 7                   # max consecutive missing trading days
+N_NEWS_A_MIN     = 30                 # >=30 articles in SELECTION_YEAR_A
+N_NEWS_B_MIN     = 30                 # AND >=30 articles in SELECTION_YEAR_B
+MIN_DOLLAR_VOL   = 5_000_000          # median daily $ volume in LIQUIDITY_YEAR
+MAX_GAP_DAYS     = 7                  # max consecutive missing trading days
 
 
 def parse_args():
@@ -81,10 +86,15 @@ def parse_args():
     p.add_argument("--news_file", default=NEWS_FILE)
     p.add_argument("--prices_dir", default=PRICES_DIR)
     p.add_argument("--out_dir", default=OUT_DIR)
-    p.add_argument("--news_val_min", type=int, default=N_NEWS_VAL_MIN)
-    p.add_argument("--news_test_min", type=int, default=N_NEWS_TEST_MIN)
+    p.add_argument("--news_a_year", type=int, default=SELECTION_YEAR_A)
+    p.add_argument("--news_b_year", type=int, default=SELECTION_YEAR_B)
+    p.add_argument("--news_a_min", type=int, default=N_NEWS_A_MIN)
+    p.add_argument("--news_b_min", type=int, default=N_NEWS_B_MIN)
+    p.add_argument("--liquidity_year", type=int, default=LIQUIDITY_YEAR)
     p.add_argument("--min_dollar_vol", type=float, default=MIN_DOLLAR_VOL)
     p.add_argument("--max_gap", type=int, default=MAX_GAP_DAYS)
+    p.add_argument("--out_suffix", default="leakfree",
+                   help="Suffix for output files: universe_main_<suffix>.csv etc.")
     return p.parse_args()
 
 
@@ -119,28 +129,29 @@ def stream_news_per_stock_per_year(news_file: str) -> pd.DataFrame:
                   f"unique_stocks={len({s for s, _ in counts})}",
                   flush=True)
 
-    # Pivot
+    # Pivot — keep ALL years 2009..2023 (used for fold-aware filters
+    # and the leakage-free selection-year requirements)
     rows = []
     by_stock = defaultdict(dict)
     for (sym, yr), n in counts.items():
         by_stock[sym][yr] = n
+    all_years = sorted({y for d in by_stock.values() for y in d.keys()})
     for sym, yrs in by_stock.items():
-        rows.append({
-            "ticker": sym,
-            "n_2022": yrs.get(2022, 0),
-            "n_2023": yrs.get(2023, 0),
-            "n_pre_2022": sum(n for y, n in yrs.items() if y < 2022),
-            "n_total": sum(yrs.values()),
-        })
+        row = {"ticker": sym, "n_total": sum(yrs.values())}
+        # Per-year columns for everything we might want downstream
+        for y in range(2009, 2024):
+            row[f"n_{y}"] = yrs.get(y, 0)
+        rows.append(row)
     df = pd.DataFrame(rows).sort_values("n_total", ascending=False)
-    print(f"[stage1] done. {len(df)} unique tickers with news.", flush=True)
+    print(f"[stage1] done. {len(df)} unique tickers with news (years: {all_years[:3]}..{all_years[-3:]}).",
+          flush=True)
     return df
 
 
 # -----------------------------------------------------------------------------
 # Stage 2: per-stock price diagnostics
 # -----------------------------------------------------------------------------
-def price_diag_one(path: str) -> dict:
+def price_diag_one(path: str, liquidity_year: int = LIQUIDITY_YEAR) -> dict:
     """Return diagnostics for one price file, or None if disqualifying."""
     try:
         df = pd.read_csv(path, usecols=["date", "open", "high", "low",
@@ -171,33 +182,33 @@ def price_diag_one(path: str) -> dict:
     # C4: gap test
     diff = df["date"].diff().dropna().dt.days
     max_gap = int(diff.max()) if len(diff) else 99
-    # Trading-day gap: weekends produce 3-day gaps; we tolerate up to MAX_GAP_DAYS.
 
-    # C3: liquidity in TEST year (median daily $ volume)
-    test_df = df[df["date"].dt.year == TEST_YEAR]
-    if len(test_df) < 100:
-        return {"error": "no_test_data"}
-    dollar_vol = test_df["close"] * test_df["volume"]
+    # C3: liquidity in LIQUIDITY_YEAR (NOT test year -- leakage-free)
+    liq_df = df[df["date"].dt.year == liquidity_year]
+    if len(liq_df) < 100:
+        return {"error": f"no_{liquidity_year}_data"}
+    dollar_vol = liq_df["close"] * liq_df["volume"]
     median_dvol = float(dollar_vol.median())
 
-    # zero-volume / low-quality test (all closes equal -> bad data)
-    if test_df["close"].std() < 1e-3 * test_df["close"].mean():
-        return {"error": "constant_test_close"}
+    if liq_df["close"].std() < 1e-3 * liq_df["close"].mean():
+        return {"error": "constant_liquidity_close"}
 
     return {
         "price_start": str(px_min.date()),
         "price_end": str(px_max.date()),
         "n_price_rows": int(len(df)),
         "max_gap_days": max_gap,
-        "median_dollar_vol_2023": median_dvol,
-        "close_test_mean": float(test_df["close"].mean()),
+        "median_dollar_vol": median_dvol,         # in liquidity_year
+        "liquidity_year": liquidity_year,
+        "close_liquidity_mean": float(liq_df["close"].mean()),
     }
 
 
-def price_diagnostics_all(prices_dir: str, candidate_tickers: set[str]) -> pd.DataFrame:
+def price_diagnostics_all(prices_dir: str, candidate_tickers: set[str],
+                          liquidity_year: int = LIQUIDITY_YEAR) -> pd.DataFrame:
     """Compute price diagnostics for every candidate ticker."""
-    print(f"[stage2] price diagnostics for {len(candidate_tickers)} candidates ...",
-          flush=True)
+    print(f"[stage2] price diagnostics for {len(candidate_tickers)} candidates "
+          f"(liquidity_year={liquidity_year}) ...", flush=True)
     rows = []
     files = glob(os.path.join(prices_dir, "*.csv"))
     sym_to_path = {os.path.splitext(os.path.basename(f))[0].upper(): f for f in files}
@@ -207,7 +218,7 @@ def price_diagnostics_all(prices_dir: str, candidate_tickers: set[str]) -> pd.Da
         if path is None:
             rows.append({"ticker": sym, "error": "no_price_file"})
             continue
-        d = price_diag_one(path)
+        d = price_diag_one(path, liquidity_year=liquidity_year)
         d["ticker"] = sym
         rows.append(d)
         if d.get("error") is None:
@@ -230,87 +241,97 @@ def main():
     news_df = stream_news_per_stock_per_year(args.news_file)
     news_df.to_csv(os.path.join(args.out_dir, "_news_per_stock.csv"), index=False)
 
-    # Apply news thresholds
+    a_col = f"n_{args.news_a_year}"
+    b_col = f"n_{args.news_b_year}"
+    if a_col not in news_df.columns:
+        news_df[a_col] = 0
+    if b_col not in news_df.columns:
+        news_df[b_col] = 0
+
+    # Apply leakage-free news thresholds
     news_pass = news_df[
-        (news_df["n_2022"] >= args.news_val_min)
-        & (news_df["n_2023"] >= args.news_test_min)
+        (news_df[a_col] >= args.news_a_min)
+        & (news_df[b_col] >= args.news_b_min)
     ].copy()
     print(f"[stage3] {len(news_pass)} tickers pass news thresholds "
-          f"(>= {args.news_val_min} in 2022 AND >= {args.news_test_min} in 2023)",
+          f"(>= {args.news_a_min} in {args.news_a_year} AND "
+          f">= {args.news_b_min} in {args.news_b_year})",
           flush=True)
 
-    # Stage 2 only on news-passing candidates (saves work)
     candidates = set(news_pass["ticker"])
-    price_df = price_diagnostics_all(args.prices_dir, candidates)
+    price_df = price_diagnostics_all(args.prices_dir, candidates,
+                                      liquidity_year=args.liquidity_year)
     price_df.to_csv(os.path.join(args.out_dir, "_price_diag.csv"), index=False)
 
     price_pass = price_df[
         (price_df["error"].isna())
         & (price_df["max_gap_days"] <= args.max_gap)
-        & (price_df["median_dollar_vol_2023"] >= args.min_dollar_vol)
+        & (price_df["median_dollar_vol"] >= args.min_dollar_vol)
     ]
-    print(f"[stage3] {len(price_pass)} tickers pass price+liquidity filters",
+    print(f"[stage3] {len(price_pass)} tickers pass price+liquidity filters "
+          f"(median $-vol {args.liquidity_year} >= ${args.min_dollar_vol/1e6:.0f}M)",
           flush=True)
 
-    # Merge and tier
     merged = news_pass.merge(price_pass, on="ticker", how="inner")
     if len(merged) == 0:
         print("ERROR: zero tickers passed all filters.", file=sys.stderr)
         sys.exit(1)
 
-    # Tier by news_2023 (the test-year coverage that actually matters most)
-    q = merged["n_2023"].quantile([0.25, 0.5, 0.75]).to_dict()
+    # Tier by selection-year news (a + b averaged)
+    merged["selection_news"] = merged[a_col] + merged[b_col]
+    q = merged["selection_news"].quantile([0.25, 0.5, 0.75]).to_dict()
     def tier_of(n):
         if n >= q[0.75]:
             return "STRONG"
         if n >= q[0.25]:
             return "MEDIUM"
         return "WEAK"
-    merged["tier"] = merged["n_2023"].apply(tier_of)
+    merged["tier"] = merged["selection_news"].apply(tier_of)
 
-    # Final selection: rank by composite score (news_2023 + news_2022 + log_dvol)
-    # to break ties on equally-covered stocks, prefer ones with higher liquidity.
+    # Composite score uses ONLY pre-train-end information (no 2022/2023 columns)
     merged["composite_score"] = (
-        np.log1p(merged["n_2023"])
-        + 0.5 * np.log1p(merged["n_2022"])
-        + 0.2 * np.log10(merged["median_dollar_vol_2023"].clip(lower=1))
+        np.log1p(merged[b_col])                                 # selection year B
+        + 0.5 * np.log1p(merged[a_col])                          # selection year A
+        + 0.2 * np.log10(merged["median_dollar_vol"].clip(lower=1))
     )
     merged = merged.sort_values("composite_score", ascending=False).reset_index(drop=True)
 
-    # Save full universe
-    full_path = os.path.join(args.out_dir, "universe_v1.csv")
+    suffix = f"_{args.out_suffix}" if args.out_suffix else ""
+    full_path = os.path.join(args.out_dir, f"universe_v1{suffix}.csv")
     merged.to_csv(full_path, index=False)
-    print(f"[stage3] universe_v1.csv: {len(merged)} stocks  -> {full_path}",
+    print(f"[stage3] universe_v1{suffix}.csv: {len(merged)} stocks  -> {full_path}",
           flush=True)
 
-    # Top-N main universe
     main = merged.head(args.target_n).copy()
-    main_path = os.path.join(args.out_dir, "universe_main.csv")
+    main_path = os.path.join(args.out_dir, f"universe_main{suffix}.csv")
     main.to_csv(main_path, index=False)
-    print(f"[stage3] universe_main.csv: {len(main)} stocks (top by composite)  "
-          f"-> {main_path}", flush=True)
+    print(f"[stage3] universe_main{suffix}.csv: {len(main)} stocks  -> {main_path}",
+          flush=True)
 
-    # Sequential-vs-global subset: 50 from STRONG tier of the main, randomly
-    # chosen with seed=2026 for reproducibility.
+    # Sequential-vs-global subset
     strong_pool = main[main["tier"] == "STRONG"]
     rng = np.random.default_rng(2026)
     if len(strong_pool) >= args.seqvsglob_n:
         idx = rng.choice(len(strong_pool), size=args.seqvsglob_n, replace=False)
         seqvsglob = strong_pool.iloc[idx].copy()
     else:
-        # If STRONG tier too small, supplement from MEDIUM
         more = main[main["tier"] != "STRONG"].head(
             args.seqvsglob_n - len(strong_pool))
         seqvsglob = pd.concat([strong_pool, more])
     seqvsglob = seqvsglob.sort_values("ticker").reset_index(drop=True)
-    seq_path = os.path.join(args.out_dir, "universe_seqvsglob.csv")
+    seq_path = os.path.join(args.out_dir, f"universe_seqvsglob{suffix}.csv")
     seqvsglob.to_csv(seq_path, index=False)
-    print(f"[stage3] universe_seqvsglob.csv: {len(seqvsglob)} stocks  "
-          f"-> {seq_path}", flush=True)
+    print(f"[stage3] universe_seqvsglob{suffix}.csv: {len(seqvsglob)} stocks  -> {seq_path}",
+          flush=True)
 
-    # Summary report
+    # Summary
     print()
     print("==================== SUMMARY ====================")
+    print(f"Selection criteria (LEAKAGE-FREE per Jury 1 fix B1+B3):")
+    print(f"  News-A: >= {args.news_a_min} articles in {args.news_a_year}")
+    print(f"  News-B: >= {args.news_b_min} articles in {args.news_b_year}")
+    print(f"  Liquidity: median $-vol in {args.liquidity_year} >= ${args.min_dollar_vol/1e6:.0f}M")
+    print()
     print(f"Total candidates with news: {len(news_df):,}")
     print(f"Pass news thresholds:       {len(news_pass):,}")
     print(f"Pass price+liquidity:       {len(price_pass):,}")
@@ -320,9 +341,9 @@ def main():
     print(f"  WEAK tier:                {(merged.tier=='WEAK').sum():,}")
     print()
     print(f"Main universe (top {args.target_n}): {len(main)} stocks")
-    print(f"  median news_2023:        {int(main['n_2023'].median()):,}")
-    print(f"  median news_2022:        {int(main['n_2022'].median()):,}")
-    print(f"  median dollar-vol 2023:  ${main['median_dollar_vol_2023'].median()/1e6:.1f}M")
+    print(f"  median news_{args.news_a_year}: {int(main[a_col].median()):,}")
+    print(f"  median news_{args.news_b_year}: {int(main[b_col].median()):,}")
+    print(f"  median $-vol {args.liquidity_year}: ${main['median_dollar_vol'].median()/1e6:.1f}M")
     print()
     print(f"Sequential-vs-Global subset: {len(seqvsglob)} stocks (STRONG tier)")
     print(f"Outputs in: {args.out_dir}")

@@ -46,6 +46,27 @@ class StockData:
 
 
 def _load_stock(ticker: str, data_dir: str = None) -> StockData | None:
+    """Load merged_v3/<TICKER>.csv with split/dividend adjustment + log1p volume.
+
+    Critical correctness fixes (per Jury 1 review 2026-05-07):
+
+    F-A (Adj Close + OHLC adjustment):
+        merged_v3 has BOTH `Close` (raw) and `Adj Close` (split/dividend adj).
+        We compute `adj_factor = Adj_Close / Close` and apply it to Open,
+        High, Low, Close uniformly so the entire OHLC tuple is internally
+        consistent with the adjusted close. This is essential because
+        major splits in the universe (AAPL 2014/2020 4:1, NVDA 2021 4:1,
+        TSLA 2020 5:1, GOOG 2022 20:1) would otherwise inject artificial
+        ±50%+ one-day returns. close_raw (used for log-return target) is
+        Adj Close.
+
+    F-G (log1p Volume):
+        Volume is right-skewed by 2-3 orders of magnitude. Raw z-score
+        gives sigma dominated by a few high-volume days. We log1p before
+        passing to z-score normalisation downstream.
+
+    Returns None on missing column / insufficient rows.
+    """
     data_dir = data_dir or DATA_DIR
     if data_dir is None:
         raise RuntimeError("DATA_DIR not set. Run rebuild_merged_v2.py first.")
@@ -61,6 +82,28 @@ def _load_stock(ticker: str, data_dir: str = None) -> StockData | None:
         return None
     df["Date"] = pd.to_datetime(df["Date"], utc=True, errors="coerce")
     df = df.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
+
+    # ----- F-A: split/dividend adjustment via adj_factor -----
+    # merged_v3 carries 'Adj Close' (FNSPID full_history adjusted close).
+    # adj_factor scales raw OHLC backward to be split-consistent with the
+    # adjusted close. Equal to 1.0 historically when no corporate actions
+    # have occurred since the date; <1 prior to a split.
+    if "Adj Close" not in df.columns:
+        # Fallback: assume already adjusted (older merged files).
+        df["Adj Close"] = df["Close"]
+    raw_close = df["Close"].astype(np.float64).values
+    adj_close = df["Adj Close"].astype(np.float64).values
+    safe_raw = np.where(raw_close > 1e-9, raw_close, 1.0)
+    adj_factor = adj_close / safe_raw
+    # Apply adjustment to Open/High/Low/Close (Volume is share count, not price).
+    for col in ("Open", "High", "Low", "Close"):
+        if col in df.columns:
+            df[col] = df[col].astype(np.float64).values * adj_factor
+
+    # ----- F-G: log1p Volume -----
+    if "Volume" in df.columns:
+        df["Volume"] = np.log1p(df["Volume"].astype(np.float64).clip(lower=0).values)
+
     feats = []
     for col in FEATURES:
         if col in df.columns:
@@ -75,6 +118,9 @@ def _load_stock(ticker: str, data_dir: str = None) -> StockData | None:
     dates = df["Date"].values[valid]
     if len(raw) < 100:
         return None
+    # close_raw: used for log-return target. Now this is the SPLIT-ADJUSTED
+    # close (because we replaced raw['Close'] with adj_factor * raw_close
+    # above). Splits no longer cause artificial one-day returns.
     return StockData(ticker=ticker, dates=dates, raw=raw,
                      close_raw=raw[:, CLOSE_IDX].copy(),
                      raw_normed=None, mu=None, sd=None)
@@ -102,13 +148,36 @@ def get_fold_dates(fold_name: str) -> dict:
 # ---------------------------------------------------------------------------
 def _fit_normalise_and_index(stk: StockData, seq_len: int, horizon: int,
                               fold_dates: dict, target_mode: str,
-                              min_close: float = 1e-6):
+                              min_close: float = 1e-6,
+                              purge: bool = True,
+                              embargo_days: int = None):
     """Fit per-stock z-score on train rows, fill stk.raw_normed, and return
     per-split index arrays of valid sample START offsets.
 
     A sample starts at index i; its anchor date is dates[i+seq_len-1] and
     target is at dates[i+seq_len+horizon-1].
+
+    PURGED WALK-FORWARD (per Jury 1 review 2026-05-07, fixing item A1+A2):
+    Instead of assigning a sample to a split based on the ANCHOR date alone,
+    we additionally require that the TARGET date is also within the same
+    split's window. This prevents train labels from reaching into val/test
+    windows when H>=5. Specifically:
+        train assigned iff:  dates[target_idx] <= fold.train_end
+        val assigned iff:    fold.val_start <= dates[target_idx] <= fold.val_end
+                              AND fold.val_start <= dates[anchor_idx]
+        test assigned iff:   fold.test_start <= dates[target_idx] <= fold.test_end
+                              AND fold.test_start <= dates[anchor_idx]
+    Samples whose target straddles a split boundary are dropped.
+
+    EMBARGO (López de Prado 2018, Ch. 7.4): An additional `embargo_days`
+    after each split end are excluded from the next split's training/eval
+    windows. Default = horizon (Lopez de Prado's recommendation for
+    overlapping returns: embargo = forecast horizon, so one full horizon's
+    worth of "warm-up" is dropped).
     """
+    if embargo_days is None:
+        embargo_days = int(horizon)
+
     N = stk.raw.shape[0]
     if N < seq_len + horizon:
         return None
@@ -125,24 +194,50 @@ def _fit_normalise_and_index(stk: StockData, seq_len: int, horizon: int,
     stk.mu = mu; stk.sd = sd
     stk.raw_normed = ((stk.raw - mu) / sd).astype(np.float32)
 
-    # Determine which i's are valid for each split (by anchor date)
+    # Embargo bounds
+    train_end = fold_dates["train_end"]
+    val_start = fold_dates["val_start"]
+    val_end   = fold_dates["val_end"]
+    test_start = fold_dates["test_start"]
+    test_end   = fold_dates["test_end"]
+    embargo_td = pd.Timedelta(days=embargo_days)
+
     train_idx, val_idx, test_idx = [], [], []
     for i in range(0, N - seq_len - horizon + 1):
         anchor_idx = i + seq_len - 1
         target_idx = i + seq_len + horizon - 1
         anchor_date = dates_pd[anchor_idx]
+        target_date = dates_pd[target_idx]
+
         # Filter on close-price validity for log-return target
         if target_mode == "log_return":
             ac = stk.close_raw[anchor_idx]; tc = stk.close_raw[target_idx]
             if ac <= min_close or tc <= min_close:
                 continue
-        if anchor_date <= fold_dates["train_end"]:
-            train_idx.append(i)
-        elif fold_dates["val_start"] <= anchor_date <= fold_dates["val_end"]:
-            val_idx.append(i)
-        elif fold_dates["test_start"] <= anchor_date <= fold_dates["test_end"]:
-            test_idx.append(i)
-        # else: gap year between train_end and val_start -> skip
+
+        if purge:
+            # Purged + embargoed assignment:
+            #   TRAIN: target_date <= train_end - embargo
+            #   VAL:   target_date in [val_start, val_end] AND anchor_date in [val_start, val_end]
+            #   TEST:  target_date in [test_start, test_end] AND anchor_date in [test_start, test_end]
+            # Samples that straddle boundaries (target outside anchor's window
+            # OR target lies inside the embargo zone) are dropped.
+            if target_date <= train_end - embargo_td:
+                train_idx.append(i)
+            elif (val_start <= anchor_date <= val_end) and (val_start <= target_date <= val_end):
+                val_idx.append(i)
+            elif (test_start <= anchor_date <= test_end) and (test_start <= target_date <= test_end):
+                test_idx.append(i)
+            # else: dropped (boundary or gap-year sample)
+        else:
+            # Legacy anchor-only assignment (kept for backward compat / ablation)
+            if anchor_date <= train_end:
+                train_idx.append(i)
+            elif val_start <= anchor_date <= val_end:
+                val_idx.append(i)
+            elif test_start <= anchor_date <= test_end:
+                test_idx.append(i)
+
     return {"train": np.array(train_idx, dtype=np.int32),
             "val":   np.array(val_idx, dtype=np.int32),
             "test":  np.array(test_idx, dtype=np.int32)}
@@ -208,7 +303,9 @@ class UnifiedDataLoader:
                  max_stocks: int | None = None,
                  target_mode: str = None,
                  num_workers: int = 0,
-                 universe_file: str = None):
+                 universe_file: str = None,
+                 purge: bool = True,
+                 embargo_days: int = None):
         self.seq_len = int(seq_len)
         self.horizon = int(horizon)
         self.batch_size = int(batch_size)
@@ -216,6 +313,8 @@ class UnifiedDataLoader:
         self.fold_dates = get_fold_dates(fold)
         self.target_mode = target_mode or TARGET_MODE
         self.num_workers = int(num_workers)
+        self.purge = bool(purge)
+        self.embargo_days = int(embargo_days) if embargo_days is not None else int(horizon)
 
         universe = load_universe(universe_file) if universe_file else load_universe()
         if max_stocks:
@@ -236,7 +335,9 @@ class UnifiedDataLoader:
             if stk is None:
                 self.skipped.append(ticker); continue
             res = _fit_normalise_and_index(stk, self.seq_len, self.horizon,
-                                            self.fold_dates, self.target_mode)
+                                            self.fold_dates, self.target_mode,
+                                            purge=self.purge,
+                                            embargo_days=self.embargo_days)
             if res is None or len(res["train"]) == 0:
                 self.skipped.append(ticker); continue
             sid = len(self.raw_normed_list)
@@ -381,9 +482,11 @@ def materialise_split(ld: UnifiedDataLoader, split: str, max_samples: int = None
 # build_samples_for_stock(...) -- delegate to the new fit/index function.
 # ---------------------------------------------------------------------------
 def build_samples_for_stock(stk: StockData, seq_len: int, horizon: int,
-                             fold_dates: dict, target_mode: str = "log_return"):
+                             fold_dates: dict, target_mode: str = "log_return",
+                             purge: bool = True, embargo_days: int = None):
     """Convenience: returns same dict as v1 (for tests)."""
-    res = _fit_normalise_and_index(stk, seq_len, horizon, fold_dates, target_mode)
+    res = _fit_normalise_and_index(stk, seq_len, horizon, fold_dates, target_mode,
+                                    purge=purge, embargo_days=embargo_days)
     if res is None:
         return None
     # Build small materialised samples (test-only, slow path)

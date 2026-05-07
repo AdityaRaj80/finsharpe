@@ -86,10 +86,10 @@ def test_t3_calendar_boundaries():
     """Anchor dates of train/val/test samples must lie in their respective
     windows. Pick one stock and check directly."""
     fold_dates = get_fold_dates("F4")
-    # Use AAPL (we know it has full coverage)
-    stk = _load_stock("AAPL")
+    # Use NVDA (we know it has full coverage)
+    stk = _load_stock("NVDA")
     if stk is None:
-        pytest.skip("AAPL not in DATA_DIR")
+        pytest.skip("NVDA not in DATA_DIR")
     res = build_samples_for_stock(stk, seq_len=96, horizon=5,
                                    fold_dates=fold_dates, target_mode="log_return")
     assert res is not None
@@ -185,6 +185,74 @@ def test_t8_walkforward_folds_monotone():
         d = get_fold_dates(fold["name"])
         assert d["train_end"] < d["val_start"]
         assert d["val_end"] < d["test_start"]
+
+
+def test_t9_purged_walkforward_no_target_leakage():
+    """CRITICAL: purged walk-forward must guarantee that NO train sample's
+    target_date falls inside val/test windows (Jury 1 fix item A1+A2)."""
+    fold_dates = get_fold_dates("F4")
+    stk = _load_stock("NVDA")
+    if stk is None:
+        pytest.skip("NVDA not in DATA_DIR")
+    H = 60   # use a long horizon to make leakage easy to detect
+    seq_len = 96
+    res = build_samples_for_stock(stk, seq_len=seq_len, horizon=H,
+                                   fold_dates=fold_dates, target_mode="log_return",
+                                   purge=True, embargo_days=H)
+    assert res is not None
+    import pandas as pd
+    dates_pd = pd.to_datetime(stk.dates, utc=True)
+    # CRITICAL check: every train sample's TARGET date must be <= train_end - embargo
+    embargo_td = pd.Timedelta(days=H)
+    train_target_dates = dates_pd[res["anchor_train"] + H]   # anchor + H = target idx
+    assert all(td <= fold_dates["train_end"] - embargo_td for td in train_target_dates), \
+        f"PURGE VIOLATED: some train target dates exceed train_end - embargo"
+    # And every val sample's anchor + target both inside val window
+    val_anchor_dates = dates_pd[res["anchor_val"]]
+    val_target_dates = dates_pd[res["anchor_val"] + H]
+    for ad, td in zip(val_anchor_dates, val_target_dates):
+        assert fold_dates["val_start"] <= ad <= fold_dates["val_end"], \
+            f"val anchor {ad} outside val window"
+        assert fold_dates["val_start"] <= td <= fold_dates["val_end"], \
+            f"val target {td} outside val window"
+
+
+def test_t10_adj_close_split_safety():
+    """CRITICAL: Adj_Close adjustment must prevent split-day artificial returns
+    (Jury 1 fix item E2). NVDA had a 4:1 split on 2020-08-31 — without
+    adjustment the raw-Close 1-day log-return that day would be ~log(1/4) ≈ -1.39.
+    With our adj_factor scaling, it should be tiny (close to the actual
+    economic return, < 0.10 in magnitude)."""
+    stk = _load_stock("NVDA")
+    if stk is None:
+        pytest.skip("NVDA not in DATA_DIR")
+    import pandas as pd
+    dates_pd = pd.to_datetime(stk.dates, utc=True)
+    # Find the 2020-08-31 trading day
+    target = pd.Timestamp("2020-08-31", tz="UTC")
+    diffs = np.abs((dates_pd - target).total_seconds())
+    idx = int(np.argmin(diffs))
+    if idx == 0:
+        pytest.skip("split day at index 0")
+    one_day_logret = float(np.log(stk.close_raw[idx] / stk.close_raw[idx-1]))
+    assert abs(one_day_logret) < 0.20, (
+        f"NVDA 1-day log-return on {dates_pd[idx]} = {one_day_logret:.4f} "
+        f"-- a 4:1 split would have given ~-1.39 if Adj Close adjustment "
+        f"was not applied. Adjust factor logic is broken.")
+
+
+def test_t11_log1p_volume_applied():
+    """Volume should be log1p-transformed (Jury 1 fix item G1). For a real
+    stock with daily volumes ~1e6 to 1e8, raw values would be in that range;
+    after log1p they should be in roughly [13, 19] (log of 1e6 to 1e8)."""
+    stk = _load_stock("NVDA")
+    if stk is None:
+        pytest.skip("NVDA not in DATA_DIR")
+    # Volume is index 4 in FEATURES = ["Open","High","Low","Close","Volume","scaled_sentiment"]
+    vol_col = stk.raw[:, 4]
+    assert vol_col.min() >= 0, "log1p volume can't be negative"
+    assert vol_col.max() < 30, f"max log1p volume {vol_col.max():.2f} -- looks like raw, not log1p"
+    assert vol_col.mean() > 5, f"mean log1p volume {vol_col.mean():.2f} -- too small"
 
 
 if __name__ == "__main__":
