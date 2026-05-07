@@ -173,3 +173,25 @@ DLINEAR_CONFIG = {
     "individual": False,
     "enc_in": len(FEATURES)
 }
+
+# Simple classical baselines (added under PLAN_v2 for the simple-vs-complex
+# axis of the benchmark contribution). Kept deliberately small so that any
+# improvement the modern transformers show over these is the price-of-complexity.
+LSTM_CONFIG = {
+    "d_model": 128,
+    "e_layers": 2,
+    "dropout": 0.1,
+}
+
+RNN_CONFIG = {
+    "d_model": 64,
+    "e_layers": 1,
+    "dropout": 0.1,
+}
+
+CNN_CONFIG = {
+    "d_model": 64,
+    "e_layers": 3,
+    "kernel_size": 3,
+    "dropout": 0.1,
+}

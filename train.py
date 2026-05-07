@@ -32,7 +32,13 @@ def get_config_for_model(model_name, horizon):
     # TimesNet excluded from the finsharpe campaign — see models/__init__.py.
     elif model_name == "DLinear":
         base.update(DLINEAR_CONFIG)
-        
+    elif model_name == "LSTM":
+        base.update(LSTM_CONFIG)
+    elif model_name == "RNN":
+        base.update(RNN_CONFIG)
+    elif model_name == "CNN":
+        base.update(CNN_CONFIG)
+
     return base
 
 def main():
