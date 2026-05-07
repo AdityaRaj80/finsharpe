@@ -37,10 +37,30 @@ os.makedirs(VALTEST_CACHE_DIR, exist_ok=True)
 FEATURES = ["Open", "High", "Low", "Close", "Volume", "scaled_sentiment"]
 CLOSE_IDX = 3  # Index of Close in FEATURES array
 
-# Target reformulation (PLAN_v2): predict log-returns directly, NOT
-# MinMax-scaled prices. This makes our MSE comparable to PatchTST,
-# iTransformer, MASTER, and the 2024 cross-sectional ranking literature.
-TARGET_MODE = "log_return"   # {"log_return", "scaled_price"}; default v2 = log_return
+# Target convention (PLAN_v2):
+#   "scaled_price": [pred_len] z-scored close window. The MSE arm uses
+#                   this directly as the regression target -- same
+#                   convention as PatchTST/iTransformer/MASTER (which
+#                   train on z-score-normalised closes via RevIN). The
+#                   "scaled" prefix here means z-score (NOT MinMax v1
+#                   bug). Cross-sectional rank-IC and downstream
+#                   trading-grade metrics (Sharpe etc.) are computed
+#                   from the model output via cross_sectional_smoke.py
+#                   which un-z-scores and converts to log-returns.
+#   "log_return":   [scalar] H-step log-return. Track-B's RiskAwareHead
+#                   computes mu_return_H from mu_close[:, -1] and
+#                   last_close internally, so the model's output is
+#                   still [pred_len] z-scored close. This mode is
+#                   useful only for non-Track-B variants that want to
+#                   train on log-return MSE directly (would require
+#                   architectural change: model output -> [scalar]
+#                   instead of [pred_len]).
+# Default v2 = "scaled_price" so the MSE arm's standard nn.MSELoss
+# matches model output shape [B, pred_len] -- target [B, pred_len]; and
+# the Track-B arm's CompositeRiskLoss handles the log-return derivation
+# internally. The cross_sectional_smoke evaluator converts predictions
+# to log-returns for the headline trading metrics.
+TARGET_MODE = "scaled_price"
 
 # Stock-split convention (PLAN_v2): use the SAME 300-stock universe across
 # train/val/test, calendar-only split. Matches MASTER/DeepClair/Qlib.

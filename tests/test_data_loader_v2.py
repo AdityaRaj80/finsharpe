@@ -129,11 +129,29 @@ def test_t4_z_score_train_aggregate(smoke_loader):
     assert stds[5] >= 0.0 and stds[5] < 50.0
 
 
-def test_t5_log_return_distribution(smoke_loader):
-    """y_train (log-returns over H=5 days) should be tiny and centred."""
-    y = smoke_loader.y_train
+def test_t5_target_distribution(smoke_loader):
+    """The eagerly-computed y_train always represents log-returns regardless
+    of TARGET_MODE (the data_loader always computes them as a diagnostic).
+    For H=5 they should be small and centred.
+    NOTE: smoke_loader.y_train is only populated when target_mode='log_return';
+    for 'scaled_price' it's a placeholder zero array. Compute manually here."""
+    from data_loader import materialise_split
+    # We force log-return materialisation by passing through the eager helper
+    # only for samples where target_mode is "log_return". Otherwise we
+    # compute log-return manually from the close_raw arrays.
+    if smoke_loader.target_mode == "log_return":
+        y = smoke_loader.y_train
+    else:
+        # Compute log-return manually from anchor + target close
+        y = np.zeros(smoke_loader.sample_table_train.shape[0], dtype=np.float32)
+        for n in range(len(y)):
+            sid = int(smoke_loader.sample_table_train[n, 0])
+            i = int(smoke_loader.sample_table_train[n, 1])
+            close = smoke_loader.close_raw_list[sid]
+            ac = close[i + smoke_loader.seq_len - 1]
+            tc = close[i + smoke_loader.seq_len + smoke_loader.horizon - 1]
+            y[n] = float(np.log(tc / ac))
     assert np.abs(y.mean()) < 0.05, f"y mean too large: {y.mean()}"
-    # Daily log-returns are ~1-2%; H=5 std should be ~0.02-0.10
     assert 0.005 < y.std() < 0.5, f"y std out of range: {y.std()}"
 
 
@@ -153,17 +171,18 @@ def test_t6_no_nan_inf(smoke_loader):
 
 
 def test_t7_dataloader_iteration(smoke_loader):
-    """One full pass through the train DataLoader."""
+    """One full pass through the train DataLoader. Target shape depends
+    on TARGET_MODE: [B] for log_return, [B, pred_len] for scaled_price."""
     loader = smoke_loader.get_train_loader(shuffle=False)
-    n_batches = 0
     n_samples = 0
     for X, y in loader:
         assert isinstance(X, torch.Tensor)
         assert X.shape[1] == 96
         assert X.shape[2] == len(FEATURES)
-        # y shape: log-return target is [B] scalar
-        assert y.shape == (X.shape[0],)
-        n_batches += 1
+        if smoke_loader.target_mode == "log_return":
+            assert y.shape == (X.shape[0],)
+        else:
+            assert y.shape == (X.shape[0], smoke_loader.horizon)
         n_samples += X.shape[0]
     assert n_samples == len(smoke_loader.X_train)
 

@@ -1,251 +1,245 @@
+"""Training driver for the v2 finsharpe campaign.
+
+Conventions (PLAN_v2):
+  * Universe: 300 stocks from `data/universe_main.csv` (leakage-free).
+  * Calendar: walk-forward fold passed via --fold (F1..F4).
+  * Target:   log-return over H trading days (not MinMax-scaled price).
+  * Same-stocks calendar-only split.
+  * Per-stock z-score fitted on TRAIN window only (no leakage).
+  * Adj-Close-adjusted OHLC + log1p Volume.
+  * Purged walk-forward + embargo (default embargo = horizon).
+
+Two arms (per cell):
+  * --use_risk_head NOT set : MSE-only baseline (plain nn.MSELoss on log-return).
+  * --use_risk_head set     : Track B (CompositeRiskLoss with phase schedule;
+                              + RiskAwareHead wrapper -> sigma + vol + gate heads).
+
+Usage:
+    python train.py --model PatchTST --horizon 5 --fold F4
+    python train.py --model GCFormer --horizon 20 --fold F4 --use_risk_head
+    python train.py --model LSTM --horizon 60 --fold F1 --use_risk_head --use_xs_sharpe
+"""
+from __future__ import annotations
+
 import argparse
+import json
 import os
-import torch
+import random
+import time
+
+import numpy as np
 import pandas as pd
-from models import model_dict
-from config import *
+import torch
+
+from config import (FEATURES, CLOSE_IDX, MODEL_SAVE_DIR, RESULTS_DIR,
+                     SEQ_LEN, HORIZONS, WALK_FORWARD_FOLDS,
+                     PATCHTST_CONFIG, TFT_CONFIG, ADAPATCH_CONFIG,
+                     GCFORMER_CONFIG, ITRANSFORMER_CONFIG,
+                     VANILLA_TRANSFORMER_CONFIG, DLINEAR_CONFIG,
+                     LSTM_CONFIG, RNN_CONFIG, CNN_CONFIG)
 from data_loader import UnifiedDataLoader
-from engine.trainer import Trainer
 from engine.evaluator import evaluate
 from engine.heads import RiskAwareHead
+from engine.trainer import Trainer
+from models import model_dict
 
-def get_config_for_model(model_name, horizon):
-    # Base config from global config
+
+def get_config_for_model(model_name: str, horizon: int) -> dict:
     base = {
         "pred_len": horizon,
         "context_len": SEQ_LEN,
-        "enc_in": len(FEATURES)
+        "enc_in": len(FEATURES),
     }
-    
-    if model_name == "PatchTST":
-        base.update(PATCHTST_CONFIG)
-    elif model_name == "TFT":
-        base.update(TFT_CONFIG)
-    elif model_name == "AdaPatch":
-        base.update(ADAPATCH_CONFIG)
-    elif model_name == "GCFormer":
-        base.update(GCFORMER_CONFIG)
-    elif model_name == "iTransformer":
-        base.update(ITRANSFORMER_CONFIG)
-    elif model_name == "VanillaTransformer":
-        base.update(VANILLA_TRANSFORMER_CONFIG)
-    # TimesNet excluded from the finsharpe campaign — see models/__init__.py.
-    elif model_name == "DLinear":
-        base.update(DLINEAR_CONFIG)
-    elif model_name == "LSTM":
-        base.update(LSTM_CONFIG)
-    elif model_name == "RNN":
-        base.update(RNN_CONFIG)
-    elif model_name == "CNN":
-        base.update(CNN_CONFIG)
-
+    cfg_map = {
+        "PatchTST": PATCHTST_CONFIG, "TFT": TFT_CONFIG,
+        "AdaPatch": ADAPATCH_CONFIG, "GCFormer": GCFORMER_CONFIG,
+        "iTransformer": ITRANSFORMER_CONFIG,
+        "VanillaTransformer": VANILLA_TRANSFORMER_CONFIG,
+        "DLinear": DLINEAR_CONFIG,
+        "LSTM": LSTM_CONFIG, "RNN": RNN_CONFIG, "CNN": CNN_CONFIG,
+    }
+    if model_name in cfg_map:
+        base.update(cfg_map[model_name])
     return base
 
+
+def set_seed(seed: int):
+    """Deterministic-ish seeding (per Jury 1 J2). PyTorch determinism for
+    CUDA isn't perfectly reproducible across hardware, but seeding all RNGs
+    + setting cudnn deterministic gives same-hardware reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
 def main():
-    parser = argparse.ArgumentParser(description='CIKM Benchmarking Framework')
-    parser.add_argument('--model', type=str, required=True, help='Model name')
-    parser.add_argument('--method', type=str, default='global', choices=['global', 'sequential'], help='Training method')
-    parser.add_argument('--horizon', type=int, required=True, help='Prediction horizon')
-    parser.add_argument('--device', type=str, default='auto', help='Device (cuda:X, hpc, or auto)')
-    parser.add_argument('--batch_size', type=int, default=128, help='Batch size')
-    parser.add_argument('--epochs', type=int, default=60, help='Max epochs (global training)')
-    parser.add_argument('--rounds', type=int, default=3, help='Rounds for sequential method')
-    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
-    parser.add_argument('--lradj', type=str, default='type3', help='LR adjust strategy')
-    parser.add_argument('--patience', type=int, default=10, help='Early stopping patience')
-    parser.add_argument('--use_amp', action='store_true', help='Use mixed precision training')
-    parser.add_argument('--adapatch_alpha', type=float, default=0.5, help='Alpha param for AdaPatch loss')
-    parser.add_argument('--epochs_per_stock', type=int, default=20, help='Epochs per stock per round in sequential training')
-    parser.add_argument('--max_stocks', type=int, default=None, help='Limit number of training stocks (for timing tests)')
-    parser.add_argument('--use_eager_global', action='store_true',
-                        help='Force the legacy in-memory global loader (default: memory-mapped streaming)')
-    parser.add_argument('--use_risk_head', action='store_true',
-                        help='Wrap backbone in RiskAwareHead (sigma + vol heads) and train with '
-                             'CompositeRiskLoss (alpha*L_SR + beta*L_NLL + gamma*L_MSE_R + '
-                             'delta*L_VOL + eta*L_GATE_BCE). Track B retraining objective.')
-    parser.add_argument('--risk_head_lookback', type=int, default=20,
-                        help='Lookback rows the sigma/vol auxiliary heads attend over.')
-    parser.add_argument('--risk_head_d_hidden', type=int, default=64,
-                        help='Hidden width of the sigma/vol auxiliary MLPs.')
-    parser.add_argument('--init_from', type=str, default=None,
-                        help='Optional path to a pre-trained checkpoint to load into the backbone '
-                             'before wrapping in RiskAwareHead (Track B fine-tune mode). '
-                             'state_dict keys without a "backbone." prefix are loaded into the '
-                             'backbone; sigma_head / vol_head are randomly initialised.')
-    parser.add_argument('--use_xs_sharpe', action='store_true',
-                        help='Track B v2 (B1): replace the per-sample Sharpe surrogate with a '
-                             'differentiable cross-sectional portfolio Sharpe — each batch is split '
-                             'into K random micro-cross-sections, each forms a long/short '
-                             'Kelly-tanh×gate portfolio with leg normalisation, and L_SR is the '
-                             'Sharpe across the K portfolio returns. The training-time loss is '
-                             'now the same operation as the inference strategy.')
-    parser.add_argument('--xs_n_subgroups', type=int, default=32,
-                        help='Number of micro-cross-sections per batch (B1 only). '
-                             'Larger K = more Sharpe samples per gradient step; default 32 with '
-                             'batch_size=512 gives chunks of 16 samples each.')
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="finsharpe v2 training driver")
 
-    if args.device == 'hpc':
-        args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        if torch.cuda.is_available():
-            # Enable TF32 for better performance on Ampere/Hopper (H100)
-            torch.set_float32_matmul_precision('high')
-    elif args.device == 'auto':
-        args.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-    
-    args.model_name = args.model # Save model name
+    # Required cell-identification args
+    p.add_argument("--model", required=True,
+                   choices=list(model_dict.keys()))
+    p.add_argument("--horizon", type=int, required=True, choices=HORIZONS)
+    p.add_argument("--fold", type=str, default="F4",
+                   choices=[f["name"] for f in WALK_FORWARD_FOLDS],
+                   help="Walk-forward CV fold to train on (default F4 headline).")
 
-    # Setup device
-    device = torch.device(args.device)
-    print(f"Using device: {device}")
+    # Training mode + arm
+    p.add_argument("--method", default="global", choices=["global", "sequential"])
+    p.add_argument("--use_risk_head", action="store_true",
+                   help="Track-B arm: wrap backbone in RiskAwareHead and train "
+                        "with CompositeRiskLoss (phase schedule). "
+                        "Without this flag = MSE-only baseline arm.")
+    p.add_argument("--use_xs_sharpe", action="store_true",
+                   help="Track-B v2: differentiable cross-sectional Sharpe loss.")
+    p.add_argument("--xs_n_subgroups", type=int, default=32)
 
-    # Load data
-    print("Loading datasets...")
-    loader = UnifiedDataLoader(seq_len=SEQ_LEN, horizon=args.horizon, batch_size=args.batch_size,
-                               max_stocks=args.max_stocks)
-    if args.use_eager_global:
-        print("Using eager val/test loaders (full arrays in RAM).")
-        val_loader, test_loader = loader.get_val_test_loaders()
-    else:
-        print("Using memory-mapped val/test loaders (bounded RAM).")
-        try:
-            val_loader, test_loader = loader.get_val_test_loaders_mmap()
-        except FileNotFoundError as e:
-            print(f"  -> {e}")
-            print("  -> Auto-building val/test cache now...")
-            import subprocess, sys
-            subprocess.run([sys.executable, "preprocess_global_cache.py", "--only-valtest"], check=True)
-            val_loader, test_loader = loader.get_val_test_loaders_mmap()
-    
-    if val_loader is None or test_loader is None:
-        print("Failed to initialize val/test loaders. Exiting.")
-        return
+    # Hyperparameters
+    p.add_argument("--batch_size", type=int, default=128)
+    p.add_argument("--epochs", type=int, default=60)
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--lradj", type=str, default="type3")
+    p.add_argument("--patience", type=int, default=10)
+    p.add_argument("--use_amp", action="store_true")
+    p.add_argument("--seed", type=int, default=2026)
 
-    # Initialize model
-    print(f"Initializing {args.model} for horizon {args.horizon}...")
+    # Risk-head architecture
+    p.add_argument("--risk_head_lookback", type=int, default=20)
+    p.add_argument("--risk_head_d_hidden", type=int, default=64)
+
+    # Optional fine-tune init
+    p.add_argument("--init_from", type=str, default=None,
+                   help="Optional pre-trained backbone checkpoint.")
+
+    # Data layer
+    p.add_argument("--max_stocks", type=int, default=None,
+                   help="Cap n stocks (smoke testing).")
+    p.add_argument("--num_workers", type=int, default=2)
+    p.add_argument("--no_purge", action="store_true",
+                   help="Disable purged walk-forward (debug only -- introduces leakage).")
+    p.add_argument("--embargo_days", type=int, default=None,
+                   help="Embargo days at split boundaries. Default = horizon.")
+
+    # Sequential-mode config
+    p.add_argument("--rounds", type=int, default=3)
+    p.add_argument("--epochs_per_stock", type=int, default=20)
+    p.add_argument("--adapatch_alpha", type=float, default=0.5)
+
+    args = p.parse_args()
+    args.model_name = args.model
+
+    # Seed RNGs
+    set_seed(args.seed)
+
+    # Device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision("high")  # TF32 on Ampere+
+    args.device = str(device)
+    print(f"[v2] device={device} | model={args.model} | H={args.horizon} | "
+          f"fold={args.fold} | arm={'riskhead' if args.use_risk_head else 'mse'} | "
+          f"batch_size={args.batch_size}")
+
+    # Build data loaders
+    print("[v2] building UnifiedDataLoader ...")
+    t0 = time.time()
+    loader = UnifiedDataLoader(
+        seq_len=SEQ_LEN, horizon=args.horizon,
+        batch_size=args.batch_size, fold=args.fold,
+        max_stocks=args.max_stocks, num_workers=args.num_workers,
+        purge=not args.no_purge,
+        embargo_days=args.embargo_days,
+    )
+    print(f"[v2] loader built in {time.time()-t0:.1f}s -> {loader!r}")
+    train_loader = loader.get_train_loader(shuffle=True)
+    val_loader = loader.get_val_loader()
+    test_loader = loader.get_test_loader()
+
+    # Build backbone
+    print(f"[v2] init {args.model} (H={args.horizon}, enc_in={len(FEATURES)})")
     configs = get_config_for_model(args.model, args.horizon)
-    model_class = model_dict[args.model]
-    backbone = model_class(configs)
+    backbone = model_dict[args.model](configs)
 
-    # Optionally load pre-trained MSE-only checkpoint into the backbone before
-    # wrapping (Track B fine-tune mode: keep the price-prediction weights,
-    # randomly init the new sigma/vol heads, fine-tune everything jointly).
+    # Optional pre-trained init
     if args.init_from is not None:
-        print(f"  -> loading backbone weights from {args.init_from}")
-        ckpt = torch.load(args.init_from, map_location='cpu')
+        print(f"[v2] init_from={args.init_from}")
+        ckpt = torch.load(args.init_from, map_location="cpu")
         if any(k.startswith("backbone.") for k in ckpt.keys()):
-            # Already a RiskAwareHead checkpoint — strip prefix.
             ckpt = {k.split("backbone.", 1)[1]: v for k, v in ckpt.items()
                     if k.startswith("backbone.")}
         missing, unexpected = backbone.load_state_dict(ckpt, strict=False)
-        if missing:
-            print(f"     missing keys: {len(missing)} (first: {missing[:3]})")
-        if unexpected:
-            print(f"     unexpected keys: {len(unexpected)} (first: {unexpected[:3]})")
+        if missing:    print(f"  missing: {len(missing)}")
+        if unexpected: print(f"  unexpected: {len(unexpected)}")
 
+    # Wrap or not
     if args.use_risk_head:
-        print(f"  -> wrapping in RiskAwareHead "
+        print(f"[v2] wrapping in RiskAwareHead "
               f"(lookback={args.risk_head_lookback}, d_hidden={args.risk_head_d_hidden})")
         model = RiskAwareHead(
-            backbone=backbone,
-            n_features=len(FEATURES),
-            pred_len=args.horizon,
-            close_idx=CLOSE_IDX,
+            backbone=backbone, n_features=len(FEATURES),
+            pred_len=args.horizon, close_idx=CLOSE_IDX,
             lookback_for_aux=args.risk_head_lookback,
             d_hidden=args.risk_head_d_hidden,
         ).to(device)
     else:
         model = backbone.to(device)
 
-    # Setup trainer
     trainer = Trainer(args, model, device)
 
-    if args.use_risk_head:
-        suffix = "_riskhead_xs" if args.use_xs_sharpe else "_riskhead"
-    else:
-        suffix = ""
-    save_name = f"{args.model}_{args.method}_H{args.horizon}{suffix}.pth"
+    # Save path: encode (model, horizon, fold, arm) so different cells don't collide
+    arm = "riskhead" if args.use_risk_head else "mse"
+    if args.use_xs_sharpe:
+        arm = "riskhead_xs"
+    save_name = f"{args.model}_{args.method}_H{args.horizon}_{args.fold}_{arm}.pth"
     save_path = os.path.join(MODEL_SAVE_DIR, save_name)
 
     # Train
-    print(f"Starting {args.method} training...")
-    if args.method == 'global':
-        if args.use_eager_global:
-            print("Using legacy eager global loader (full dataset in RAM).")
-            train_loader = loader.get_global_train_loader()
-        else:
-            print("Using memory-mapped global loader (bounded RAM).")
-            try:
-                train_loader = loader.get_global_train_loader_mmap()
-            except FileNotFoundError as e:
-                print(f"  -> {e}")
-                print("  -> Auto-building cache now...")
-                import subprocess, sys
-                subprocess.run([sys.executable, "preprocess_global_cache.py"], check=True)
-                train_loader = loader.get_global_train_loader_mmap()
+    print(f"[v2] starting training ({args.method} mode, {args.epochs} epochs)")
+    t0 = time.time()
+    if args.method == "global":
         model = trainer.train_global(train_loader, val_loader, test_loader, save_path)
-    elif args.method == 'sequential':
-        # Pass the loader object (not a pre-built list) so the trainer can lazily
-        # iter_train_loaders() one stock at a time, bounding memory to O(1).
-        model = trainer.train_sequential(loader, val_loader, test_loader, save_path)
-        
-    print("Training complete. Evaluating on test set...")
-    model.load_state_dict(torch.load(save_path))
-    # The evaluator extracts mu_close from dict outputs, so this works
-    # regardless of whether the model is risk-head-wrapped or plain.
-    test_metrics = evaluate(
-        model, test_loader, device,
-        close_min=getattr(loader, 'test_close_min', None),
-        close_max=getattr(loader, 'test_close_max', None),
-    )
-
-    # Save results — both scaled-space (MSE/MAE/R²) and dollar-space metrics.
-    # Dollar metrics are absent if close_min/max were not exposed by the data loader.
-    if args.use_risk_head:
-        res_suffix = "_riskhead_xs" if args.use_xs_sharpe else "_riskhead"
     else:
-        res_suffix = ""
-    res_path = os.path.join(RESULTS_DIR, f"{args.method}_results{res_suffix}.csv")
-    row = {
-        "Model": args.model,
-        "Horizon": args.horizon,
-        "use_risk_head": int(bool(args.use_risk_head)),
-        "MSE":  test_metrics['mse'],
-        "MAE":  test_metrics['mae'],
-        "RMSE": test_metrics['rmse'],
-        "R2":   test_metrics['r2'],
-        "MSE_USD":  test_metrics.get('mse_usd',  float('nan')),
-        "MAE_USD":  test_metrics.get('mae_usd',  float('nan')),
-        "RMSE_USD": test_metrics.get('rmse_usd', float('nan')),
-    }
-    res_df = pd.DataFrame([row])
-    
-    # Robust schema-aware CSV write:
-    #   - Old CSVs may have only [Model, Horizon, MSE, MAE, R2]; new runs add USD cols.
-    #   - We read-merge-write (rather than append) so missing cols become NaN cleanly.
-    #   - Retries on PermissionError (Excel lock); falls back to a horizon-specific
-    #     backup file if the main CSV stays locked.
-    import time as _time
-    written = False
-    for attempt in range(5):
-        try:
-            if os.path.exists(res_path):
-                existing = pd.read_csv(res_path)
-                merged = pd.concat([existing, res_df], ignore_index=True)
-            else:
-                merged = res_df
-            merged.to_csv(res_path, index=False)
-            written = True
-            break
-        except PermissionError:
-            print(f"[CSV LOCKED] attempt {attempt+1}/5 — sleeping 30s before retry...")
-            _time.sleep(30)
-    if not written:
-        backup = os.path.join(RESULTS_DIR, f"{args.method}_results{res_suffix}_{args.model}_H{args.horizon}_backup.csv")
-        res_df.to_csv(backup, index=False)
-        print(f"[BACKUP WRITE] Main CSV still locked. Saved to: {backup}")
+        # Sequential mode operates per-stock; not the headline path. Kept
+        # for the seqvsglob side-finding ablation only.
+        model = trainer.train_sequential(loader, val_loader, test_loader, save_path)
+    train_secs = time.time() - t0
+    print(f"[v2] training done in {train_secs/60:.1f} min")
 
-    print(f"Final Test Metrics for {args.model} (H={args.horizon}): MSE={test_metrics['mse']:.5f}, MAE={test_metrics['mae']:.5f}, R2={test_metrics['r2']:.5f}")
+    # Final test eval
+    print("[v2] evaluating on test set ...")
+    model.load_state_dict(torch.load(save_path, map_location=device))
+    test_metrics = evaluate(model, test_loader, device)
+
+    # Result CSV row -- one row per cell, append-safe.
+    res_path = os.path.join(RESULTS_DIR, f"results_{args.fold}_{arm}.csv")
+    row = {
+        "model": args.model,
+        "horizon": args.horizon,
+        "fold": args.fold,
+        "arm": arm,
+        "batch_size": args.batch_size,
+        "seed": args.seed,
+        "n_train": int(loader.sample_table_train.shape[0]),
+        "n_val":   int(loader.sample_table_val.shape[0]),
+        "n_test":  int(loader.sample_table_test.shape[0]),
+        "n_stocks_used": len(loader.universe) - len(loader.skipped),
+        "train_minutes": train_secs / 60,
+        "test_loss": float(test_metrics.get("loss", float("nan"))),
+        "test_mse":  float(test_metrics.get("mse", float("nan"))),
+        "test_mae":  float(test_metrics.get("mae", float("nan"))),
+        "ckpt_path": save_path,
+    }
+    df = pd.DataFrame([row])
+    if os.path.exists(res_path):
+        df.to_csv(res_path, mode="a", header=False, index=False)
+    else:
+        df.to_csv(res_path, index=False)
+    print(f"[v2] result row appended -> {res_path}")
+    print(json.dumps(row, indent=2))
+
 
 if __name__ == "__main__":
     main()
