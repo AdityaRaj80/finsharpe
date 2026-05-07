@@ -357,7 +357,7 @@ def main():
         best_n = int(sweep_df.iloc[sweep_df["val_sharpe_gross"].idxmax()]["top_n"])
     print(f"[eval_v2] best top_n on val = {best_n}")
 
-    # Apply to test
+    # Apply to test (HEADLINE protocol: long-short at best_top_n).
     pos_t = cs_positions(test_P, best_n, args.mode)
     cost_table = {}
     for c in cost_grid:
@@ -374,6 +374,37 @@ def main():
         print(f"  cost={c:>4.1f} bps : net_Sharpe={cost_table[float(c)]['net_sharpe']:6.3f}  "
               f"MDD={cost_table[float(c)]['net_mdd']:.3f}  "
               f"cumret={cost_table[float(c)]['net_cumulative_return']:6.3f}",
+              flush=True)
+
+    # ─── Long-only protocol (peer-comparable to MASTER/HIST/FactorVAE).
+    # Computes Sharpe of the long leg ALONE (top-N equal-weight) so our
+    # numbers can be directly compared to peer papers that report
+    # long-only top-K Sharpe (gross).
+    # We do this at TWO N values:
+    #   * best_top_n          — the same N selected by val sweep above (apples
+    #                            to apples with our long-short headline).
+    #   * peer_top_n = 30      — top 10% of universe; matches MASTER's Top-30
+    #                            convention on CSI300 and HIST's Top-50/CSI300
+    #                            (~17%). 10% is the standard quintile-decile
+    #                            split in the factor-investing literature.
+    longonly_table = {}
+    for n_label, n in (("best_n", best_n), ("peer30", 30)):
+        pos_lo = cs_positions(test_P, n, "long_only")
+        for c in cost_grid:
+            gross, net, _ = portfolio_returns(pos_lo, test_A, cost_bps=c)
+            net_nover = net[::args.horizon]
+            longonly_table[f"{n_label}_c{int(c)}"] = {
+                "n_label": n_label, "top_n": int(n), "cost_bps": c,
+                "longonly_net_sharpe": annualized_sharpe(net_nover, args.horizon),
+                "longonly_net_mdd": max_drawdown(net_nover),
+                "longonly_net_cumulative_return": cumulative_return(net_nover),
+            }
+    # Print one summary row (peer N=30 at 20bps) for visibility.
+    p30 = longonly_table.get("peer30_c20", {})
+    if p30:
+        print(f"  [long-only N=30 @ 20bps]  Sharpe={p30.get('longonly_net_sharpe', float('nan')):6.3f}  "
+              f"MDD={p30.get('longonly_net_mdd', float('nan')):.3f}  "
+              f"cumret={p30.get('longonly_net_cumulative_return', float('nan')):6.3f}",
               flush=True)
 
     # Cross-sectional rank-IC (Spearman)
@@ -399,6 +430,7 @@ def main():
         "ci_tier": HORIZON_CI_TIER.get(args.horizon, "unknown"),
         "ic_mean": ic_mean, "ic_std": ic_std,
         "cost_sensitivity": cost_table,
+        "longonly_appendix": longonly_table,
         "sweep_topn": sweep,
     }
 
@@ -408,12 +440,18 @@ def main():
     # series with a Newey-White HAC block when the non-overlapping series
     # has n<6 (typical at H=60 on a 1-year fold) — restoring statistical
     # power at long horizons that were previously untestable.
+    # Long-only series ALSO written for peer-comparable Sharpe (2026-05-08).
     ts_path = os.path.join(OUT_DIR,
         f"timeseries_{args.model}_H{args.horizon}_{args.fold}_{args.arm}.csv")
     gross_t, net_t_default, _ = portfolio_returns(pos_t, test_A, cost_bps=20.0)
+    # Long-only at peer N=30 — gross + net20.
+    pos_lo30 = cs_positions(test_P, 30, "long_only")
+    lo_gross_t, lo_net_t, _ = portfolio_returns(pos_lo30, test_A, cost_bps=20.0)
     # Non-overlapping series: subsampled every H rows.
     nover_gross = gross_t[::args.horizon]
     nover_net   = net_t_default[::args.horizon]
+    lo_nover_g  = lo_gross_t[::args.horizon]
+    lo_nover_n  = lo_net_t[::args.horizon]
     # Daily-overlap series: full-length, one entry per anchor day.
     n_full = len(gross_t)
     df_ts = {
@@ -423,6 +461,13 @@ def main():
             [nover_net, np.full(n_full - len(nover_net), np.nan)]),
         "portfolio_return_gross_daily": gross_t,
         "portfolio_return_net20_daily": net_t_default,
+        # Long-only N=30 columns (peer-comparable to MASTER/HIST/FactorVAE).
+        "longonly_n30_gross_nonoverlap": np.concatenate(
+            [lo_nover_g, np.full(n_full - len(lo_nover_g), np.nan)]),
+        "longonly_n30_net20_nonoverlap": np.concatenate(
+            [lo_nover_n, np.full(n_full - len(lo_nover_n), np.nan)]),
+        "longonly_n30_gross_daily": lo_gross_t,
+        "longonly_n30_net20_daily": lo_net_t,
     }
     pd.DataFrame(df_ts).to_csv(ts_path, index=False)
 

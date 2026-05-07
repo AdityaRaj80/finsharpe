@@ -203,7 +203,7 @@ def main():
         best_n = int(sweep_df.iloc[sweep_df["val_sharpe_gross"].idxmax()]["top_n"])
     print(f"[baseline] best top_n on val = {best_n}")
 
-    # Apply to test.
+    # Apply to test (HEADLINE: long-short).
     pos_t = cs_positions(test_P, best_n, args.mode)
     cost_table = {}
     for c in cost_grid:
@@ -220,6 +220,26 @@ def main():
         print(f"  cost={c:>4.1f} bps : net_Sharpe={cost_table[float(c)]['net_sharpe']:6.3f}  "
               f"MDD={cost_table[float(c)]['net_mdd']:.3f}  "
               f"cumret={cost_table[float(c)]['net_cumulative_return']:6.3f}",
+              flush=True)
+
+    # ─── Long-only appendix (peer-comparable to MASTER/HIST/FactorVAE).
+    longonly_table = {}
+    for n_label, n in (("best_n", best_n), ("peer30", 30)):
+        pos_lo = cs_positions(test_P, n, "long_only")
+        for c in cost_grid:
+            gross, net, _ = portfolio_returns(pos_lo, test_A, cost_bps=c)
+            net_nover = net[::args.horizon]
+            longonly_table[f"{n_label}_c{int(c)}"] = {
+                "n_label": n_label, "top_n": int(n), "cost_bps": c,
+                "longonly_net_sharpe": annualized_sharpe(net_nover, args.horizon),
+                "longonly_net_mdd": max_drawdown(net_nover),
+                "longonly_net_cumulative_return": cumulative_return(net_nover),
+            }
+    p30 = longonly_table.get("peer30_c20", {})
+    if p30:
+        print(f"  [long-only N=30 @ 20bps]  Sharpe={p30.get('longonly_net_sharpe', float('nan')):6.3f}  "
+              f"MDD={p30.get('longonly_net_mdd', float('nan')):.3f}  "
+              f"cumret={p30.get('longonly_net_cumulative_return', float('nan')):6.3f}",
               flush=True)
 
     # Cross-sectional rank-IC.
@@ -244,13 +264,17 @@ def main():
         "ci_tier": HORIZON_CI_TIER.get(args.horizon, "unknown"),
         "ic_mean": ic_mean, "ic_std": ic_std,
         "cost_sensitivity": cost_table,
+        "longonly_appendix": longonly_table,
         "sweep_topn": sweep,
     }
 
     ts_path = os.path.join(OUT_DIR,
         f"timeseries_BASELINE-{args.strategy}_H{args.horizon}_{args.fold}_baseline.csv")
     gross_t, net_t_default, _ = portfolio_returns(pos_t, test_A, cost_bps=20.0)
+    pos_lo30 = cs_positions(test_P, 30, "long_only")
+    lo_gross_t, lo_net_t, _ = portfolio_returns(pos_lo30, test_A, cost_bps=20.0)
     nover_g = gross_t[::args.horizon]; nover_n = net_t_default[::args.horizon]
+    lo_nover_g = lo_gross_t[::args.horizon]; lo_nover_n = lo_net_t[::args.horizon]
     n_full = len(gross_t)
     pd.DataFrame({
         "portfolio_return_gross_nonoverlap": np.concatenate(
@@ -259,6 +283,12 @@ def main():
             [nover_n, np.full(n_full - len(nover_n), np.nan)]),
         "portfolio_return_gross_daily": gross_t,
         "portfolio_return_net20_daily": net_t_default,
+        "longonly_n30_gross_nonoverlap": np.concatenate(
+            [lo_nover_g, np.full(n_full - len(lo_nover_g), np.nan)]),
+        "longonly_n30_net20_nonoverlap": np.concatenate(
+            [lo_nover_n, np.full(n_full - len(lo_nover_n), np.nan)]),
+        "longonly_n30_gross_daily": lo_gross_t,
+        "longonly_n30_net20_daily": lo_net_t,
     }).to_csv(ts_path, index=False)
 
     summary_path = os.path.join(OUT_DIR,
