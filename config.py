@@ -129,15 +129,19 @@ WALK_FORWARD_FOLDS = [
 # ─────────────────────────────────────────────────────────────────────────────
 # All models will output [B, pred_len] (univariate future Close)
 
+# Jury 2 fix F18 (2026-05-08): PatchTST shrunk to ICLR'23 published config.
+# Was: d=256, L=6, h=8, drop=0.1 (over-deep for noisy 6-channel input).
+# Now: d=128, L=3, h=16, drop=0.2, patch_len=24 (longer patch for 504-day
+# lookback). Halves parameter count; raises dropout to combat overfit.
 PATCHTST_CONFIG = {
-    "d_model": 256,
-    "n_heads": 8,
-    "e_layers": 6,
-    "d_ff": 512,
-    "patch_len": 16,
-    "stride": 8,
-    "dropout": 0.1,
-    "fc_dropout": 0.05,
+    "d_model": 128,
+    "n_heads": 16,
+    "e_layers": 3,
+    "d_ff": 256,
+    "patch_len": 24,
+    "stride": 12,
+    "dropout": 0.2,
+    "fc_dropout": 0.1,
     "head_dropout": 0.0,
     "individual": 1,
     "revin": 1,
@@ -146,12 +150,15 @@ PATCHTST_CONFIG = {
     "padding_patch": "end"
 }
 
+# Jury 2 fix F19: TFT dropout 0.1 → 0.3 (Lim 2021 finance-default).
+# Width 256 is over Lim's 160; we keep 256 to ensure capacity for the
+# variable-selection layer but raise dropout to compensate.
 TFT_CONFIG = {
     "d_model": 256,
     "n_heads": 4,
     "d_ff": 256,
     "lstm_layers": 2,
-    "dropout": 0.1,
+    "dropout": 0.3,
     "quantiles": [0.1, 0.5, 0.9]
 }
 
@@ -165,6 +172,9 @@ ADAPATCH_CONFIG = {
     "alpha": 0.5  # Customizable via CLI
 }
 
+# Jury 2 fix F20 (2026-05-08): GCFormer dropout raised 0.05 → 0.2 (was
+# severely under-regularised on a noisy 6-feature input). Width kept at
+# 256 — model is already at ~8M params so capacity is not the bottleneck.
 GCFORMER_CONFIG = {
     "d_model": 256,
     "n_heads": 8,
@@ -173,8 +183,8 @@ GCFORMER_CONFIG = {
     "d_ff": 512,
     "patch_len": 16,
     "stride": 8,
-    "dropout": 0.05,
-    "fc_dropout": 0.05,
+    "dropout": 0.2,
+    "fc_dropout": 0.2,
     "head_dropout": 0.0,
     "individual": 1,
     "revin": 1,
@@ -243,9 +253,14 @@ RNN_CONFIG = {
     "dropout": 0.1,
 }
 
+# Jury 2 fix F21 (2026-05-08): CNN receptive field extended via 6 dilated
+# blocks (dilations 1,2,4,8,16,32) so the model can see ~64 input
+# timesteps. Previous 3-layer dilated TCN (dilations 1,2,4) had RF≈15
+# which is wildly insufficient for SEQ_LEN=504. The CNN backbone respects
+# `e_layers` and uses `2**i` dilation per block (see models/cnn.py).
 CNN_CONFIG = {
     "d_model": 64,
-    "e_layers": 3,
+    "e_layers": 6,
     "kernel_size": 3,
     "dropout": 0.1,
 }

@@ -42,15 +42,27 @@ if [ "$ARM" = "riskhead" ]; then
     ARM_FLAGS="--use_risk_head"
 fi
 
+# Training-recipe defaults updated 2026-05-08 (Jury 2 fixes F14-F17):
+#   --epochs 80         (was 60; matches HIST CIKM'22 / closer to PatchTST 100)
+#   --patience 20       (was 10; on val rank-IC instead of val MSE — IC is
+#                       noisier, longer patience needed)
+#   --lradj cosine      (was type3; warmup 5 epochs then cosine to lr/100)
+#   --warmup_epochs 5
+#   --lr 3e-4           (was 1e-4; with warmup + cosine, can afford a higher
+#                       peak LR — matches PatchTST AdamW recipe.)
+#   --lr_min 3e-6
 python train.py \
     --model "$MODEL" \
     --horizon "$HORIZON" \
     --fold "$FOLD" \
     --method global \
     --batch_size "${BATCH_SIZE:-128}" \
-    --epochs 60 \
-    --lr 1e-4 \
-    --patience 10 \
+    --epochs 80 \
+    --lr 3e-4 \
+    --lr_min 3e-6 \
+    --lradj cosine \
+    --warmup_epochs 5 \
+    --patience 20 \
     --use_amp \
     $ARM_FLAGS
 

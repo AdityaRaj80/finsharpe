@@ -39,7 +39,7 @@ from config import (FEATURES, CLOSE_IDX, MODEL_SAVE_DIR, RESULTS_DIR,
                      LSTM_CONFIG, RNN_CONFIG, CNN_CONFIG)
 from data_loader import UnifiedDataLoader
 from engine.evaluator import evaluate
-from engine.heads import RiskAwareHead
+from engine.heads import RiskAwareHead, MSEReturnHead
 from engine.trainer import Trainer
 from models import model_dict
 
@@ -101,7 +101,12 @@ def main():
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--epochs", type=int, default=60)
     p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--lradj", type=str, default="type3")
+    p.add_argument("--lr_min", type=float, default=None,
+                   help="Floor on LR for cosine schedule (default lr/100).")
+    p.add_argument("--lradj", type=str, default="type3",
+                   choices=["type1", "type3", "cosine", "none"])
+    p.add_argument("--warmup_epochs", type=int, default=5,
+                   help="Linear warmup epochs (cosine schedule only).")
     p.add_argument("--patience", type=int, default=10)
     p.add_argument("--use_amp", action="store_true")
     p.add_argument("--seed", type=int, default=2026)
@@ -174,7 +179,13 @@ def main():
         if missing:    print(f"  missing: {len(missing)}")
         if unexpected: print(f"  unexpected: {len(unexpected)}")
 
-    # Wrap or not
+    # Wrap the backbone according to the arm.
+    # Jury 2 fix B1+B2 (2026-05-08): the MSE arm is now wrapped in
+    # MSEReturnHead so it outputs a [B] real-log-return scalar (same
+    # signal space as Track-B's mu_return_H). This makes the eval-time
+    # cross-sectional ranking apples-to-apples between arms; the
+    # previous z-delta hack injected an inverse-volatility bias.
+    # AdaPatch retains its dual-loss training and is NOT wrapped.
     if args.use_risk_head:
         print(f"[v2] wrapping in RiskAwareHead "
               f"(lookback={args.risk_head_lookback}, d_hidden={args.risk_head_d_hidden})")
@@ -184,8 +195,12 @@ def main():
             lookback_for_aux=args.risk_head_lookback,
             d_hidden=args.risk_head_d_hidden,
         ).to(device)
-    else:
+    elif args.model == "AdaPatch":
+        # AdaPatch trains a reconstruction co-loss; keep its native head.
         model = backbone.to(device)
+    else:
+        print(f"[v2] wrapping in MSEReturnHead (pred_len={args.horizon})")
+        model = MSEReturnHead(backbone=backbone, pred_len=args.horizon).to(device)
 
     trainer = Trainer(args, model, device)
 
@@ -200,7 +215,10 @@ def main():
     print(f"[v2] starting training ({args.method} mode, {args.epochs} epochs)")
     t0 = time.time()
     if args.method == "global":
-        model = trainer.train_global(train_loader, val_loader, test_loader, save_path)
+        # Pass the UnifiedDataLoader instance so the trainer can compute
+        # per-day val rank-IC for early stopping (Jury 2 fix F14).
+        model = trainer.train_global(train_loader, val_loader, test_loader,
+                                       save_path, data_loader_obj=loader)
     else:
         # Sequential mode operates per-stock; not the headline path. Kept
         # for the seqvsglob side-finding ablation only.

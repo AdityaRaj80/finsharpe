@@ -43,6 +43,7 @@ class StockData:
     raw_normed: np.ndarray     # [N, n_features] float32 (z-scored on train window)
     mu: np.ndarray             # [n_features] train-window mean
     sd: np.ndarray             # [n_features] train-window std
+    dates_int64: np.ndarray = None   # [N] np.int64 (epoch nanoseconds) for fast date-based pivots
 
 
 def _load_stock(ticker: str, data_dir: str = None) -> StockData | None:
@@ -121,9 +122,14 @@ def _load_stock(ticker: str, data_dir: str = None) -> StockData | None:
     # close_raw: used for log-return target. Now this is the SPLIT-ADJUSTED
     # close (because we replaced raw['Close'] with adj_factor * raw_close
     # above). Splits no longer cause artificial one-day returns.
+    # dates_int64 is np.datetime64[ns] cast to int64 (nanoseconds since epoch);
+    # used by eval_v2 to align cross-stock panel rows by CALENDAR DATE.
+    dates_int64 = pd.to_datetime(dates, utc=True).astype("datetime64[ns]") \
+        .astype(np.int64)
     return StockData(ticker=ticker, dates=dates, raw=raw,
                      close_raw=raw[:, CLOSE_IDX].copy(),
-                     raw_normed=None, mu=None, sd=None)
+                     raw_normed=None, mu=None, sd=None,
+                     dates_int64=dates_int64)
 
 
 # ---------------------------------------------------------------------------
@@ -163,17 +169,23 @@ def _fit_normalise_and_index(stk: StockData, seq_len: int, horizon: int,
     split's window. This prevents train labels from reaching into val/test
     windows when H>=5. Specifically:
         train assigned iff:  dates[target_idx] <= fold.train_end
-        val assigned iff:    fold.val_start <= dates[target_idx] <= fold.val_end
-                              AND fold.val_start <= dates[anchor_idx]
-        test assigned iff:   fold.test_start <= dates[target_idx] <= fold.test_end
-                              AND fold.test_start <= dates[anchor_idx]
+        val assigned iff:    fold.val_start + embargo <= dates[anchor_idx]
+                              AND dates[target_idx] <= fold.val_end - embargo
+        test assigned iff:   fold.test_start + embargo <= dates[anchor_idx]
+                              AND dates[target_idx] <= fold.test_end - embargo
     Samples whose target straddles a split boundary are dropped.
 
-    EMBARGO (López de Prado 2018, Ch. 7.4): An additional `embargo_days`
-    after each split end are excluded from the next split's training/eval
-    windows. Default = horizon (Lopez de Prado's recommendation for
-    overlapping returns: embargo = forecast horizon, so one full horizon's
-    worth of "warm-up" is dropped).
+    EMBARGO (López de Prado 2018, Ch. 7.4): SYMMETRIC embargo applied at
+    EVERY split boundary -- not just train→val. The previous implementation
+    only embargoed train→val, leaving the val→test boundary unguarded so
+    val-tuned hyperparameters were selected on data calendar-adjacent to
+    test (Jury 2 finding N1, 2026-05-08).
+
+    Trading-day units (Jury 2 finding N5): embargo_days is interpreted
+    as TRADING days (matching the horizon convention) and converted to
+    a calendar-time delta via ×7/5 to compensate for weekends/holidays.
+    Without this, an embargo of e.g. 5 calendar days actually only
+    purges ~3.5 trading days, ~30% under-embargo.
     """
     if embargo_days is None:
         embargo_days = int(horizon)
@@ -194,13 +206,17 @@ def _fit_normalise_and_index(stk: StockData, seq_len: int, horizon: int,
     stk.mu = mu; stk.sd = sd
     stk.raw_normed = ((stk.raw - mu) / sd).astype(np.float32)
 
-    # Embargo bounds
+    # Embargo bounds (Jury 2 fix N1+N5: trading-day units, symmetric).
+    # Convert trading days → calendar days via ×7/5 (5 trading days = 1 week
+    # = 7 calendar days). Use ceil to be conservative (purge slightly more
+    # rather than slightly less).
     train_end = fold_dates["train_end"]
     val_start = fold_dates["val_start"]
     val_end   = fold_dates["val_end"]
     test_start = fold_dates["test_start"]
     test_end   = fold_dates["test_end"]
-    embargo_td = pd.Timedelta(days=embargo_days)
+    embargo_cal_days = int(np.ceil(embargo_days * 7.0 / 5.0))
+    embargo_td = pd.Timedelta(days=embargo_cal_days)
 
     train_idx, val_idx, test_idx = [], [], []
     for i in range(0, N - seq_len - horizon + 1):
@@ -216,19 +232,26 @@ def _fit_normalise_and_index(stk: StockData, seq_len: int, horizon: int,
                 continue
 
         if purge:
-            # Purged + embargoed assignment:
+            # SYMMETRIC purged + embargoed assignment (Jury 2 fix N1):
             #   TRAIN: target_date <= train_end - embargo
-            #   VAL:   target_date in [val_start, val_end] AND anchor_date in [val_start, val_end]
-            #   TEST:  target_date in [test_start, test_end] AND anchor_date in [test_start, test_end]
-            # Samples that straddle boundaries (target outside anchor's window
-            # OR target lies inside the embargo zone) are dropped.
+            #   VAL:   anchor_date >= val_start + embargo
+            #          AND target_date <= val_end - embargo
+            #   TEST:  anchor_date >= test_start + embargo
+            #          AND target_date <= test_end
+            # The +embargo on anchor_date guards against features overlapping
+            # the prior split's labelled returns. The -embargo on target_date
+            # guards against labels reaching into the next split. The test
+            # split has no -embargo on target (it's the last split).
+            # Samples falling inside any embargo zone are dropped.
             if target_date <= train_end - embargo_td:
                 train_idx.append(i)
-            elif (val_start <= anchor_date <= val_end) and (val_start <= target_date <= val_end):
+            elif (anchor_date >= val_start + embargo_td) and \
+                 (target_date <= val_end - embargo_td):
                 val_idx.append(i)
-            elif (test_start <= anchor_date <= test_end) and (test_start <= target_date <= test_end):
+            elif (anchor_date >= test_start + embargo_td) and \
+                 (target_date <= test_end):
                 test_idx.append(i)
-            # else: dropped (boundary or gap-year sample)
+            # else: dropped (boundary or embargo zone sample)
         else:
             # Legacy anchor-only assignment (kept for backward compat / ablation)
             if anchor_date <= train_end:
@@ -335,12 +358,18 @@ class UnifiedDataLoader:
 
         self.raw_normed_list = []      # one [N_s, F] float32 per stock
         self.close_raw_list = []       # one [N_s] float64 per stock
+        self.dates_int64_list = []     # one [N_s] int64 per stock (calendar-date aligned)
         self.scalers = {}              # {ticker: (mu, sd)}
         self.skipped = []
         # Per-split sample tables: rows = (stock_id, start_offset, anchor_offset)
         train_rows, val_rows, test_rows = [], [], []
         train_stock_id, val_stock_id, test_stock_id = [], [], []
         train_anchor, val_anchor, test_anchor = [], [], []
+        # Calendar dates of anchor + target for each split
+        # (Jury 2 fix B3 / F4: cross-stock panel pivot requires CALENDAR
+        # alignment, not per-stock anchor index alignment.)
+        train_anchor_dt, val_anchor_dt, test_anchor_dt = [], [], []
+        train_target_dt, val_target_dt, test_target_dt = [], [], []
 
         for ticker in universe:
             stk = _load_stock(ticker)
@@ -355,11 +384,15 @@ class UnifiedDataLoader:
             sid = len(self.raw_normed_list)
             self.raw_normed_list.append(stk.raw_normed)
             self.close_raw_list.append(stk.close_raw)
+            self.dates_int64_list.append(stk.dates_int64)
             self.scalers[ticker] = (stk.mu, stk.sd)
-            for i_arr, rows, sids, anchors in [
-                (res["train"], train_rows, train_stock_id, train_anchor),
-                (res["val"],   val_rows,   val_stock_id,   val_anchor),
-                (res["test"],  test_rows,  test_stock_id,  test_anchor),
+            for i_arr, rows, sids, anchors, anchor_dts, target_dts in [
+                (res["train"], train_rows, train_stock_id, train_anchor,
+                 train_anchor_dt, train_target_dt),
+                (res["val"],   val_rows,   val_stock_id,   val_anchor,
+                 val_anchor_dt, val_target_dt),
+                (res["test"],  test_rows,  test_stock_id,  test_anchor,
+                 test_anchor_dt, test_target_dt),
             ]:
                 if len(i_arr) == 0:
                     continue
@@ -370,9 +403,15 @@ class UnifiedDataLoader:
                 ]))
                 sids.append(np.full(len(i_arr), sid, dtype=np.int32))
                 anchors.append((i_arr + self.seq_len - 1).astype(np.int32))
+                # Calendar dates (int64 nanoseconds since epoch)
+                anchor_idx_arr = i_arr + self.seq_len - 1
+                target_idx_arr = i_arr + self.seq_len + self.horizon - 1
+                anchor_dts.append(stk.dates_int64[anchor_idx_arr].astype(np.int64))
+                target_dts.append(stk.dates_int64[target_idx_arr].astype(np.int64))
 
         def _vstack(rows): return np.concatenate(rows, axis=0) if rows else np.zeros((0, 3), dtype=np.int32)
         def _vec(rows): return np.concatenate(rows, axis=0) if rows else np.zeros(0, dtype=np.int32)
+        def _vec64(rows): return np.concatenate(rows, axis=0) if rows else np.zeros(0, dtype=np.int64)
 
         self.sample_table_train = _vstack(train_rows)
         self.sample_table_val   = _vstack(val_rows)
@@ -383,6 +422,13 @@ class UnifiedDataLoader:
         self.train_anchor_idx = _vec(train_anchor)
         self.val_anchor_idx   = _vec(val_anchor)
         self.test_anchor_idx  = _vec(test_anchor)
+        # Calendar dates per sample (parallel arrays to sample_table_*)
+        self.train_anchor_date = _vec64(train_anchor_dt)
+        self.val_anchor_date   = _vec64(val_anchor_dt)
+        self.test_anchor_date  = _vec64(test_anchor_dt)
+        self.train_target_date = _vec64(train_target_dt)
+        self.val_target_date   = _vec64(val_target_dt)
+        self.test_target_date  = _vec64(test_target_dt)
 
         # Convenience attributes (eagerly compute targets for diagnostic
         # use; this is small -- one float per sample, so n_train * 4 bytes).

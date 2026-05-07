@@ -30,31 +30,43 @@ def evaluate(model, test_loader, device, criterion=None,
         for batch in test_loader:
             # v2 loader returns (X, y_main, y_logret); legacy 2-tuple support
             if len(batch) == 3:
-                batch_x, batch_y, _ = batch
+                batch_x, batch_y, y_logret = batch
+                y_logret_d = y_logret.float().to(device)
             else:
                 batch_x, batch_y = batch
+                y_logret_d = None
             batch_x = batch_x.float().to(device)
             batch_y = batch_y.float().to(device)
 
-            # Forward pass
-            # Note:
-            #   * AdaPatch returns a tuple (pred, slice, decode) — first element is the prediction.
-            #   * RiskAwareHead returns a dict; "mu_close" is the back-compatible price prediction
-            #     tensor of shape [B, pred_len], which is what we score against batch_y.
+            # Forward pass + per-arm scoring (Jury 2 fix B1+B2, 2026-05-08).
+            # Three cases:
+            #   * RiskAwareHead   -> dict; score mu_return_H against y_logret.
+            #   * MSEReturnHead   -> [B] log-return; score against y_logret.
+            #   * AdaPatch / legacy backbone -> [B, pred_len] z-scored close
+            #     window; score against batch_y (the legacy z-scored target).
             outputs = model(batch_x, None)
-            if isinstance(outputs, tuple):
-                outputs = outputs[0]
             if isinstance(outputs, dict):
-                # Score regression metrics against the price head only — the
-                # composite training loss is non-stationary across the warm-up
-                # schedule and would not be a meaningful early-stopping signal.
-                outputs = outputs["mu_close"]
+                pred = outputs["mu_return_H"]
+                target = y_logret_d if y_logret_d is not None else batch_y
+            elif isinstance(outputs, tuple):
+                # AdaPatch path: still scoring on z-scored close (the model's
+                # native target, used for its reconstruction co-loss).
+                pred = outputs[0]
+                target = batch_y
+            elif outputs.dim() == 1 or (outputs.dim() == 2 and outputs.shape[1] == 1):
+                # MSEReturnHead: [B] or [B, 1] log-return scalar.
+                pred = outputs.squeeze(-1) if outputs.dim() == 2 else outputs
+                target = y_logret_d if y_logret_d is not None else batch_y
+            else:
+                # Legacy backbone: [B, pred_len] z-scored close window.
+                pred = outputs
+                target = batch_y
 
-            loss = criterion(outputs, batch_y)
+            loss = criterion(pred, target)
             total_loss += loss.item()
 
-            preds.append(outputs.detach().cpu().numpy())
-            trues.append(batch_y.detach().cpu().numpy())
+            preds.append(pred.detach().cpu().numpy())
+            trues.append(target.detach().cpu().numpy())
 
     preds = np.concatenate(preds, axis=0)
     trues = np.concatenate(trues, axis=0)

@@ -42,7 +42,7 @@ sys.path.insert(0, os.path.dirname(_HERE))
 from config import (CLOSE_IDX, FEATURES, MODEL_SAVE_DIR, RESULTS_DIR,
                      SEQ_LEN, HORIZON_CI_TIER)
 from data_loader import UnifiedDataLoader
-from engine.heads import RiskAwareHead
+from engine.heads import RiskAwareHead, MSEReturnHead
 from models import model_dict
 from train import get_config_for_model
 
@@ -54,33 +54,45 @@ os.makedirs(OUT_DIR, exist_ok=True)
 # Forward + per-sample predicted log-return extraction
 # ---------------------------------------------------------------------------
 def predict_logret(model, loader, device, arm: str, ld: UnifiedDataLoader,
-                    split: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Return per-sample (pred_logret, actual_logret, stock_id, anchor_idx)
-    over the entire `split` window.
+                    split: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return per-sample (pred_logret, actual_logret, stock_id, anchor_idx,
+    anchor_date) over the entire `split` window.
+
+    Apples-to-apples (Jury 2 fix B1+B2, 2026-05-08): both arms produce a
+    real-log-return prediction:
+
+        * MSE arm        — model is `MSEReturnHead(backbone)`; its
+                            forward returns `[B]` predicted log-return.
+        * Track-B arm    — model is `RiskAwareHead(backbone)`; we read
+                            `out["mu_return_H"]`, also a `[B]` predicted
+                            log-return.
+
+    The previous z-delta hack injected an inverse-volatility bias in the
+    MSE arm and made the two arms incomparable; both paths are removed.
 
     Args
     ----
-        arm   : "mse" or "riskhead". For MSE we un-z-score the model's
-                [B, pred_len] last-step prediction; for Track-B we use the
-                RiskAwareHead's mu_return_H output directly.
+        arm   : "mse" or "riskhead". Determines which output channel to read.
         split : "val" or "test".
+
+    Returns
+    -------
+        pred_logret    : [N] predicted H-step log-return per sample
+        actual_logret  : [N] true H-step log-return per sample (from loader)
+        stock_ids      : [N] int stock identifier
+        anchor_idxs    : [N] within-stock anchor index (legacy, for diagnostics)
+        anchor_dates   : [N] int64 anchor calendar date (ns since epoch);
+                         used by `build_panel` for calendar-aligned pivot.
     """
     sample_table = {"val": ld.sample_table_val, "test": ld.sample_table_test}[split]
+    anchor_dates_split = (ld.val_anchor_date if split == "val"
+                            else ld.test_anchor_date)
     n_total = sample_table.shape[0]
     pred_logret = np.zeros(n_total, dtype=np.float64)
     actual_logret = np.zeros(n_total, dtype=np.float64)
     stock_ids = sample_table[:, 0].astype(np.int32)
     anchor_idxs = sample_table[:, 2].astype(np.int32)
-
-    # Per-stock scaler arrays for un-z-scoring (MSE arm only)
-    universe = ld.universe
-    mu_close = np.zeros(len(universe), dtype=np.float64)
-    sd_close = np.zeros(len(universe), dtype=np.float64)
-    for sid, ticker in enumerate(universe):
-        if ticker in ld.scalers:
-            mu, sd = ld.scalers[ticker]
-            mu_close[sid] = float(mu[CLOSE_IDX])
-            sd_close[sid] = float(sd[CLOSE_IDX])
+    anchor_dates = anchor_dates_split.astype(np.int64)
 
     model.eval()
     cursor = 0
@@ -95,70 +107,83 @@ def predict_logret(model, loader, device, arm: str, ld: UnifiedDataLoader,
 
             if arm == "riskhead":
                 assert isinstance(out, dict), "Track-B arm expects dict output"
-                # Track-B's return_head outputs predicted log-return directly
-                # (real return units, comparable across stocks).
                 pred_lr = out["mu_return_H"].cpu().numpy().astype(np.float64)
-            else:  # mse
+            else:  # mse — MSEReturnHead returns [B] log-return scalar
                 if isinstance(out, dict):
-                    out = out["mu_close"]
-                if isinstance(out, tuple):
-                    out = out[0]
-                # out is [B, pred_len] in z-scored close space.
-                # Bug fix 2026-05-07 (diagnosed via z-delta vs un-z-score
-                # rank-IC test): un-z-scoring with per-stock (mu, sd)
-                # injects a per-stock multiplicative scale bias that
-                # corrupts the cross-sectional ranking. The COMPARABLE
-                # cross-stock signal is the z-score-space DELTA between
-                # predicted and anchor close. Ranking by z-delta lifts
-                # PatchTST/H5/F4 IC from -0.006 -> +0.020, Sharpe from
-                # -0.35 -> +0.86.
-                pred_z = out[:, -1].cpu().numpy().astype(np.float64)
-                anchor_z = X[:, -1, CLOSE_IDX].cpu().numpy().astype(np.float64)
-                pred_lr = pred_z - anchor_z   # z-score-space delta
+                    # Defensive: legacy checkpoint that was wrapped in
+                    # RiskAwareHead even for the MSE arm. Read mu_return_H.
+                    pred_lr = out["mu_return_H"].cpu().numpy().astype(np.float64)
+                elif isinstance(out, tuple):
+                    # AdaPatch legacy path or backbone returning a tuple.
+                    arr = out[0].cpu().numpy().astype(np.float64)
+                    if arr.ndim == 2 and arr.shape[1] > 1:
+                        # Legacy [B, pred_len] z-scored close — refuse to rank
+                        # on this (it injects bias). Caller must retrain with
+                        # MSEReturnHead.
+                        raise RuntimeError(
+                            "MSE arm checkpoint produces [B, pred_len] z-scored "
+                            "close, but this version of eval_v2 ranks on real "
+                            "log-return only (Jury 2 fix B1+B2). Retrain with "
+                            "MSEReturnHead-wrapped backbone.")
+                    pred_lr = arr.squeeze(-1)
+                else:
+                    arr = out.cpu().numpy().astype(np.float64)
+                    if arr.ndim == 2 and arr.shape[1] > 1:
+                        raise RuntimeError(
+                            "MSE arm checkpoint produces [B, pred_len] z-scored "
+                            "close, but this version of eval_v2 ranks on real "
+                            "log-return only. Retrain with MSEReturnHead.")
+                    pred_lr = arr.squeeze(-1) if arr.ndim == 2 else arr
 
             pred_logret[cursor:cursor + B] = pred_lr
             actual_logret[cursor:cursor + B] = y_logret.numpy().astype(np.float64)
             cursor += B
 
     assert cursor == n_total, f"forward pass didn't cover all samples ({cursor}/{n_total})"
-    return pred_logret, actual_logret, stock_ids, anchor_idxs
+    return pred_logret, actual_logret, stock_ids, anchor_idxs, anchor_dates
 
 
 # ---------------------------------------------------------------------------
-# Pivot to [T, N] panel
+# Pivot to [T, N] panel BY CALENDAR DATE
 # ---------------------------------------------------------------------------
 def build_panel(pred_lr: np.ndarray, actual_lr: np.ndarray,
-                stock_ids: np.ndarray, anchor_idxs: np.ndarray,
-                ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Pivot per-sample (pred, actual) into [T, N] panels.
+                stock_ids: np.ndarray, anchor_dates: np.ndarray,
+                ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Pivot per-sample (pred, actual) into [T, N] panels aligned BY DATE.
 
-    The anchor_idx is the per-stock index of the anchor day. Different stocks
-    have different anchor_idxs for the same calendar date (because their
-    histories start at different dates). For cross-sectional ranking we
-    align by anchor INDEX (within-stock day), accepting that this is
-    approximate. To make it exact we'd thread calendar dates through.
+    Jury 2 fix B3 (2026-05-08): row T of the panel now corresponds to a
+    SHARED calendar date across all stocks. Stocks not trading on date T
+    (or with no sample anchored on that date) get NaN in row T.
+    Previously the pivot used per-stock anchor INDEX, which paired
+    different calendar dates for different stocks in the same panel row —
+    destroying the cross-sectional Sharpe / IC interpretation entirely.
 
-    For now we use intersection: clip every stock to the COMMON shortest
-    sample-count, indexing into anchor_idxs per stock. Same convention as
-    v1 'intersect' alignment.
+    Args
+    ----
+        pred_lr       : [N] predicted log-return per sample
+        actual_lr     : [N] true log-return per sample
+        stock_ids     : [N] int stock identifier
+        anchor_dates  : [N] int64 anchor calendar date (ns since epoch)
 
-    Returns (P [T, N], A [T, N], stock_id_unique).
+    Returns
+    -------
+        P : [T, N_stocks] predicted log-return panel (NaN where missing)
+        A : [T, N_stocks] actual    log-return panel (NaN where missing)
+        unique_stocks : [N_stocks] sorted unique stock IDs
+        unique_dates  : [T]        sorted unique anchor dates (int64 ns)
     """
-    unique = np.unique(stock_ids)
-    per_stock = {}
-    for sid in unique:
-        m = stock_ids == sid
-        # Sort by anchor_idx so within-stock samples are chronological
-        order = np.argsort(anchor_idxs[m])
-        per_stock[int(sid)] = (pred_lr[m][order], actual_lr[m][order])
-    T = min(len(p[0]) for p in per_stock.values())
-    P = np.full((T, len(unique)), np.nan)
-    A = np.full((T, len(unique)), np.nan)
-    for j, sid in enumerate(unique):
-        p, a = per_stock[int(sid)]
-        P[:T, j] = p[:T]
-        A[:T, j] = a[:T]
-    return P, A, unique
+    unique_dates  = np.unique(anchor_dates)
+    unique_stocks = np.unique(stock_ids)
+    T = len(unique_dates)
+    M = len(unique_stocks)
+    # Map each row sample to (date_idx, stock_idx) via searchsorted.
+    date_idx  = np.searchsorted(unique_dates,  anchor_dates)
+    stock_idx = np.searchsorted(unique_stocks, stock_ids)
+    P = np.full((T, M), np.nan, dtype=np.float64)
+    A = np.full((T, M), np.nan, dtype=np.float64)
+    P[date_idx, stock_idx] = pred_lr
+    A[date_idx, stock_idx] = actual_lr
+    return P, A, unique_stocks, unique_dates
 
 
 # ---------------------------------------------------------------------------
@@ -186,19 +211,36 @@ def cs_positions(pred_M: np.ndarray, top_n: int, mode: str = "long_short"):
 
 
 def portfolio_returns(pos: np.ndarray, actu_M: np.ndarray, cost_bps: float = 0.0):
+    """Compute gross/net portfolio returns and turnover per row.
+
+    `cost_bps` is interpreted as ONE-SIDE cost in basis points (e.g. 20 bps
+    one-side ≈ 40 bps round-trip). Turnover is the L1 distance between
+    consecutive position vectors, which already counts BOTH legs of every
+    trade (entering a long + exiting a short on the same day contributes
+    |w_long_new| + |w_short_old| to turnover). Therefore the cost charge
+    is `cost_bps × turnover / 10_000` — already a round-trip equivalent.
+
+    Jury 2 fix N9 (2026-05-08): turnover at the FIRST trading row is now
+    correctly computed against the zero starting position. The previous
+    bug skipped rows entirely when `pos[t]==0`, leaving `prev` un-updated
+    and double-counting turnover on the next non-zero row.
+    """
     T, N = pos.shape
     gross = np.full(T, np.nan)
     net = np.full(T, np.nan)
     turnover = np.zeros(T)
     prev = np.zeros(N)
     for t in range(T):
-        if np.all(pos[t] == 0):
+        # Always compute turnover (even on zero-position rows — they pay
+        # the cost of UNWINDING the prior position when relevant).
+        to = float(np.sum(np.abs(pos[t] - prev)))
+        turnover[t] = to
+        if np.all(pos[t] == 0) and to == 0.0:
+            # Truly idle row (no position, no trade); skip return calc.
             prev = pos[t].copy()
             continue
         valid = ~np.isnan(actu_M[t])
         gross[t] = float((pos[t][valid] * actu_M[t][valid]).sum())
-        to = float(np.sum(np.abs(pos[t] - prev)))
-        turnover[t] = to
         net[t] = gross[t] - (cost_bps / 10000.0) * to
         prev = pos[t].copy()
     return gross, net, turnover
@@ -270,27 +312,31 @@ def main():
                             batch_size=args.batch_size, fold=args.fold)
     print(f"[eval_v2] {ld!r}")
 
-    # Build model
+    # Build model — wrap per arm. Jury 2 fix B1+B2: MSE arm now uses
+    # MSEReturnHead so its output is real-log-return scalar (apples-to-
+    # apples with Track-B's mu_return_H).
     configs = get_config_for_model(args.model, args.horizon)
     backbone = model_dict[args.model](configs)
     if args.arm == "riskhead":
         model = RiskAwareHead(backbone, len(FEATURES), args.horizon, CLOSE_IDX,
                                20, 64).to(device)
-    else:
+    elif args.model == "AdaPatch":
         model = backbone.to(device)
+    else:
+        model = MSEReturnHead(backbone, args.horizon).to(device)
     model.load_state_dict(torch.load(args.ckpt, map_location=device))
 
     # Forward pass (val + test)
     print("[eval_v2] forward pass val ...")
-    val_pred, val_act, val_sid, val_aidx = predict_logret(
+    val_pred, val_act, val_sid, val_aidx, val_adate = predict_logret(
         model, None, device, args.arm, ld, "val")
     print("[eval_v2] forward pass test ...")
-    test_pred, test_act, test_sid, test_aidx = predict_logret(
+    test_pred, test_act, test_sid, test_aidx, test_adate = predict_logret(
         model, None, device, args.arm, ld, "test")
 
-    # Pivot to panels
-    val_P, val_A, _ = build_panel(val_pred, val_act, val_sid, val_aidx)
-    test_P, test_A, _ = build_panel(test_pred, test_act, test_sid, test_aidx)
+    # Pivot to panels (BY CALENDAR DATE — Jury 2 fix B3, 2026-05-08).
+    val_P, val_A, _, val_dates_unique  = build_panel(val_pred,  val_act,  val_sid,  val_adate)
+    test_P, test_A, _, test_dates_unique = build_panel(test_pred, test_act, test_sid, test_adate)
     print(f"[eval_v2] val panel: {val_P.shape}, test panel: {test_P.shape}")
 
     # Sweep top_n on val
@@ -356,14 +402,29 @@ def main():
         "sweep_topn": sweep,
     }
 
-    # Save timeseries CSV for downstream paired-bootstrap
+    # Save timeseries CSV for downstream paired-bootstrap.
+    # Jury 2 fix B8 / F24 (2026-05-08): write BOTH non-overlapping (legacy)
+    # and OVERLAPPING DAILY return series. The aggregator uses the daily
+    # series with a Newey-White HAC block when the non-overlapping series
+    # has n<6 (typical at H=60 on a 1-year fold) — restoring statistical
+    # power at long horizons that were previously untestable.
     ts_path = os.path.join(OUT_DIR,
         f"timeseries_{args.model}_H{args.horizon}_{args.fold}_{args.arm}.csv")
     gross_t, net_t_default, _ = portfolio_returns(pos_t, test_A, cost_bps=20.0)
-    pd.DataFrame({
-        "portfolio_return_gross_nonoverlap": gross_t[::args.horizon],
-        "portfolio_return_net20_nonoverlap": net_t_default[::args.horizon],
-    }).to_csv(ts_path, index=False)
+    # Non-overlapping series: subsampled every H rows.
+    nover_gross = gross_t[::args.horizon]
+    nover_net   = net_t_default[::args.horizon]
+    # Daily-overlap series: full-length, one entry per anchor day.
+    n_full = len(gross_t)
+    df_ts = {
+        "portfolio_return_gross_nonoverlap": np.concatenate(
+            [nover_gross, np.full(n_full - len(nover_gross), np.nan)]),
+        "portfolio_return_net20_nonoverlap": np.concatenate(
+            [nover_net, np.full(n_full - len(nover_net), np.nan)]),
+        "portfolio_return_gross_daily": gross_t,
+        "portfolio_return_net20_daily": net_t_default,
+    }
+    pd.DataFrame(df_ts).to_csv(ts_path, index=False)
 
     summary_path = os.path.join(OUT_DIR,
         f"summary_{args.model}_H{args.horizon}_{args.fold}_{args.arm}.json")

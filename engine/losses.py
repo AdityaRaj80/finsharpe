@@ -148,7 +148,7 @@ class CompositeRiskLoss(nn.Module):
         beta: float = 0.5,
         delta: float = 0.3,
         eta: float = 0.1,
-        alpha_pos: float = 5.0,
+        alpha_pos: float = 10.0,
         eps_sigma: float = 1e-3,
         eps_sharpe: float = 1e-3,
         gate_temp_init: float = 1.0,
@@ -158,9 +158,17 @@ class CompositeRiskLoss(nn.Module):
         s_vol: float = 1.0,
         tau_sigma: float = 0.0,
         s_sigma: float = 1.0,
-        # Schedule boundaries (epoch indices, 0-based)
-        phase1_end: int = 5,
-        phase2_end: int = 15,
+        # Schedule boundaries (epoch indices, 0-based).
+        # Jury 2 fix F17 (2026-05-08): widened from (5, 15) → (8, 25) to
+        # match the 80-epoch budget; P3 (≥phase2_end) now occupies epochs
+        # 25-79 (55 epochs of Sharpe-driven training) instead of 15-59
+        # (45 epochs). This also gives the EMA-tracked tau buffers more
+        # warm-up time to stabilise before the gate becomes a binding
+        # constraint.
+        phase1_end: int = 8,
+        phase2_end: int = 25,
+        # Sign-margin BCE option (Jury 2 fix F12).
+        bce_use_margin: bool = True,
         # B1 (differentiable cross-sectional portfolio layer) toggles.
         # When `use_xs_sharpe=True`, L_SR is computed as the Sharpe of K
         # synthetic-cross-section portfolio returns per batch, where each
@@ -180,7 +188,14 @@ class CompositeRiskLoss(nn.Module):
         # Scheduled coefficients (set by step_epoch)
         self.alpha = 0.0   # SR_gated
         self.gamma = 1.0   # MSE_R
-        # Gate hyperparameters
+        # Gate hyperparameters.
+        # Jury 2 fix CR3 (2026-05-08): alpha_pos lowered 50 → 10 after
+        # discovering 50 over-saturates tanh once σ is calibrated to the
+        # actual H-step return scale. With σ_H ≈ 0.05 (H=20) and
+        # mu_return_H ≈ 0.005 at convergence, α=10 gives argument ≈ 1
+        # (mid-saturation: tanh(1)≈0.76) — preserves position-amplitude
+        # gradient. α=50 gave argument 50 → tanh ≈ 1 (binary positions,
+        # gradient zero everywhere except sign-flip boundary).
         self.alpha_pos = float(alpha_pos)
         self.eps_sigma = float(eps_sigma)
         self.eps_sharpe = float(eps_sharpe)
@@ -195,22 +210,38 @@ class CompositeRiskLoss(nn.Module):
         # Schedule
         self._phase1_end = int(phase1_end)
         self._phase2_end = int(phase2_end)
+        # EMA-tracked tau buffers now live in RiskAwareHead, NOT here
+        # (Jury 2 fix CR1+CR2, 2026-05-08). RiskAwareHead is a child of
+        # the wrapped model so:
+        #   (a) `model.eval()` propagates and stops EMA updates;
+        #   (b) `model.state_dict()` correctly saves/loads them.
+        # The loss reads them via `model.get_tau()` (with bias correction).
+        # We keep a reference to the host head set in the FIRST forward.
+        self._head_ref: nn.Module | None = None
+        # BCE target option
+        self.bce_use_margin = bool(bce_use_margin)
         # B1 toggles
         self.use_xs_sharpe = bool(use_xs_sharpe)
         self.xs_n_subgroups = int(xs_n_subgroups)
 
     # ───────────────────────────────────────────────── schedule ──
     def step_epoch(self, epoch: int) -> None:
-        """Update α, γ, gate_temp per the warm-up schedule."""
+        """Update α, γ, gate_temp per the warm-up schedule.
+
+        Jury 2 fix F11 (2026-05-08): P3 γ raised 0.2 → 0.5 so the MSE_R
+        anchor never drops below half the SR weight. The previous γ=0.2
+        starved the only term aligned with the eval ranking objective
+        precisely when the high-variance Sharpe gradient took over.
+        """
         if epoch < self._phase1_end:
             self.alpha = 0.0
             self.gamma = 1.0
         elif epoch < self._phase2_end:
             self.alpha = 0.3
-            self.gamma = 0.5
+            self.gamma = 0.7
         else:
             self.alpha = 0.7
-            self.gamma = 0.2
+            self.gamma = 0.5
 
         # Gate temperature: T = max(T_min, T_init * decay^epoch)
         self.gate_temp = max(
@@ -219,6 +250,15 @@ class CompositeRiskLoss(nn.Module):
         )
 
     # ───────────────────────────────────────────────── forward ──
+    def attach_head(self, head: nn.Module) -> None:
+        """Bind to a RiskAwareHead so the loss can read its EMA tau buffers.
+
+        Called once by Trainer at construction time. The reference is
+        stored as a plain attribute (NOT a submodule) to avoid
+        double-counting head parameters in `criterion.parameters()`.
+        """
+        self._head_ref = head
+
     def forward(
         self,
         output: Dict[str, torch.Tensor],
@@ -283,17 +323,28 @@ class CompositeRiskLoss(nn.Module):
         position = torch.tanh(self.alpha_pos * mu_return_H / (sigma + self.eps_sigma))
 
         # ─── Gate: continuous, annealed-temperature ───
-        # Jury 2 fix E2: tau_sigma=0 (default) makes sigma_gate
-        # monotonically <= 0.5 because sigma > 0 always. The gate then
-        # collapses to ~0 as T anneals down -- the architectural
-        # contribution would be silently broken. We override tau_sigma
-        # and tau_vol to per-batch MEDIAN values so the gate distinguishes
-        # "this sample is unusually risky" from "this sample is normally
-        # risky" (relative comparison instead of absolute threshold).
+        # Jury 2 fix CR1+CR2 (2026-05-08): EMA tau buffers now live in
+        # RiskAwareHead so model.eval() correctly stops their updates and
+        # they persist with the model checkpoint. Bias-correction is
+        # applied via `head.get_tau()` for unbiased estimates even at
+        # short training horizons (Jury 2 fix IMP1, decay=0.95).
         T = self.gate_temp
-        with torch.no_grad():
-            tau_sigma_eff = sigma.detach().median()
-            tau_vol_eff = log_vol_pred.detach().median()
+        if self._head_ref is not None:
+            # Update EMAs (no-op in eval mode); read bias-corrected values.
+            self._head_ref.update_tau_ema(sigma, log_vol_pred)
+            tau_sigma_eff, tau_vol_eff = self._head_ref.get_tau()
+            # If buffers haven't been initialised (eval on a legacy
+            # checkpoint with no head), fall back to per-batch median.
+            if int(self._head_ref._tau_ema_step.item()) == 0:
+                with torch.no_grad():
+                    tau_sigma_eff = sigma.detach().median()
+                    tau_vol_eff = log_vol_pred.detach().median()
+        else:
+            # Loss used outside Trainer (e.g., a unit test); fall back
+            # to per-batch median (no persistence, no train/eval gate).
+            with torch.no_grad():
+                tau_sigma_eff = sigma.detach().median()
+                tau_vol_eff = log_vol_pred.detach().median()
         gate_vol = torch.sigmoid((tau_vol_eff - log_vol_pred) / (self.s_vol * T))
         gate_sigma = torch.sigmoid((tau_sigma_eff - sigma) / (self.s_sigma * T))
         gate = gate_vol * gate_sigma                                 # [B], in [0, 1]
@@ -354,19 +405,38 @@ class CompositeRiskLoss(nn.Module):
         # a sequentially-trained secondary classifier; here it supervises an
         # internal sigmoid×sigmoid gate end-to-end, with T-annealing.
         #
+        # Jury 2 fix F12 (2026-05-08): when `bce_use_margin=True` (default),
+        # the BCE supervises only CONFIDENT profitable trades — those whose
+        # |position·return| exceeds the within-batch median of |position·
+        # return|. Without this, as the model improves at predicting sign,
+        # `profitable=1` for ~all samples and the BCE target collapses to
+        # near-uniform 1, pushing the gate to a useless constant.
+        #
         # We compute BCE manually (mathematically identical to
         # `F.binary_cross_entropy(gate, target)`) because the fused PyTorch
         # kernel is autocast-unsafe under bf16/fp16: it raises
         # "binary_cross_entropy is unsafe to autocast" and refuses to run.
-        # The manual form uses torch.log + arithmetic which ARE autocast-safe.
-        # Recommendation in the docs is to use BCEWithLogits, but our gate is
-        # already a product of two sigmoids and is reused downstream as a
-        # multiplicative weight on returns, so we keep the sigmoid form and
-        # implement BCE inline.
-        profitable = (position * true_return_H > 0).float()          # [B] target
-        gate_clamped = gate.clamp(1e-6, 1.0 - 1e-6)
-        L_GATE_BCE = -(profitable * torch.log(gate_clamped) +
-                       (1.0 - profitable) * torch.log(1.0 - gate_clamped)).mean()
+        pnl = position * true_return_H                              # [B]
+        sign_profit = (pnl > 0).float()                             # [B] in {0, 1}
+        if self.bce_use_margin:
+            # "Confident" mask: only supervise samples whose absolute P&L
+            # exceeds the within-batch median |P&L|. Samples below median
+            # contribute zero to the BCE (don't push gate toward either
+            # extreme), so the gate stays informative as the model improves.
+            with torch.no_grad():
+                abs_pnl = pnl.detach().abs()
+                margin_thresh = abs_pnl.median()
+                confident_mask = (abs_pnl >= margin_thresh).float()
+            # Supervise only on confident samples; weight others to zero.
+            gate_clamped = gate.clamp(1e-6, 1.0 - 1e-6)
+            bce_per_sample = -(sign_profit * torch.log(gate_clamped) +
+                                (1.0 - sign_profit) * torch.log(1.0 - gate_clamped))
+            denom = confident_mask.sum().clamp(min=1.0)
+            L_GATE_BCE = (bce_per_sample * confident_mask).sum() / denom
+        else:
+            gate_clamped = gate.clamp(1e-6, 1.0 - 1e-6)
+            L_GATE_BCE = -(sign_profit * torch.log(gate_clamped) +
+                           (1.0 - sign_profit) * torch.log(1.0 - gate_clamped)).mean()
 
         # ─── Composite ───
         L_total = (
