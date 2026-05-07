@@ -95,29 +95,26 @@ def predict_logret(model, loader, device, arm: str, ld: UnifiedDataLoader,
 
             if arm == "riskhead":
                 assert isinstance(out, dict), "Track-B arm expects dict output"
+                # Track-B's return_head outputs predicted log-return directly
+                # (real return units, comparable across stocks).
                 pred_lr = out["mu_return_H"].cpu().numpy().astype(np.float64)
             else:  # mse
                 if isinstance(out, dict):
                     out = out["mu_close"]
                 if isinstance(out, tuple):
                     out = out[0]
-                # out is [B, pred_len] in z-scored close space
-                pred_z_close = out[:, -1].cpu().numpy().astype(np.float64)
-                # Un-z-score per-sample
-                sid_batch = stock_ids[cursor:cursor + B]
-                mu_b = mu_close[sid_batch]
-                sd_b = sd_close[sid_batch]
-                pred_close_raw = pred_z_close * sd_b + mu_b
-                # Anchor close from loader
-                anchor_close = np.array([
-                    ld.close_raw_list[int(s)][int(a)]
-                    for s, a in zip(sid_batch, anchor_idxs[cursor:cursor + B])
-                ], dtype=np.float64)
-                # Guard against negative un-z-scored predictions (rare, but
-                # would NaN in log)
-                safe_pred = np.maximum(pred_close_raw, 1e-6)
-                safe_anchor = np.maximum(anchor_close, 1e-6)
-                pred_lr = np.log(safe_pred / safe_anchor)
+                # out is [B, pred_len] in z-scored close space.
+                # Bug fix 2026-05-07 (diagnosed via z-delta vs un-z-score
+                # rank-IC test): un-z-scoring with per-stock (mu, sd)
+                # injects a per-stock multiplicative scale bias that
+                # corrupts the cross-sectional ranking. The COMPARABLE
+                # cross-stock signal is the z-score-space DELTA between
+                # predicted and anchor close. Ranking by z-delta lifts
+                # PatchTST/H5/F4 IC from -0.006 -> +0.020, Sharpe from
+                # -0.35 -> +0.86.
+                pred_z = out[:, -1].cpu().numpy().astype(np.float64)
+                anchor_z = X[:, -1, CLOSE_IDX].cpu().numpy().astype(np.float64)
+                pred_lr = pred_z - anchor_z   # z-score-space delta
 
             pred_logret[cursor:cursor + B] = pred_lr
             actual_logret[cursor:cursor + B] = y_logret.numpy().astype(np.float64)
