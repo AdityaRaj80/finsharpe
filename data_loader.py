@@ -1,540 +1,413 @@
+"""Data loader v2 — same-stocks calendar-only split, log-return targets,
+walk-forward fold support, train-only per-stock z-score normalisation.
+
+Conventions (PLAN_v2):
+  * Universe: 300 stocks from `data/universe_main.csv`. SAME stocks across
+    train/val/test (matches MASTER/DeepClair/Qlib/FactorVAE convention).
+  * Features: ["Open","High","Low","Close","Volume","scaled_sentiment"]
+    (6 features; CLOSE_IDX=3).
+  * Target: H-step log-return  y = log(close[i+seq_len+H-1] / close[i+seq_len-1]).
+  * Normalisation: per-stock z-score with mu, sd computed on the FOLD's
+    TRAINING WINDOW ONLY (no leakage).
+  * Walk-forward CV: 4 folds (F1..F4) per config.WALK_FORWARD_FOLDS.
+  * Calendar boundary: a sample whose anchor (last input day) date falls
+    in a split's window belongs to that split.
+
+Memory model: per-stock raw_normed arrays cached in RAM (300 stocks *
+~3,800 days * 6 features * 8 bytes = 55 MB total). Samples are produced
+LAZILY in __getitem__ -- no 10 GB materialised tensor.
+"""
+from __future__ import annotations
+
 import os
-import glob
-import json
+from dataclasses import dataclass
+
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import MinMaxScaler
+import torch
 from torch.utils.data import Dataset, DataLoader
 
-from config import (DATA_DIR, FEATURES, CLOSE_IDX, NAMES_50, SEQ_LEN,
-                    CACHE_DIR, VALTEST_CACHE_DIR, VAL_START_DATE, TEST_START_DATE)
-
-class TS_Dataset(Dataset):
-    def __init__(self, data_x, data_y):
-        self.data_x = data_x
-        self.data_y = data_y
-
-    def __len__(self):
-        return len(self.data_x)
-
-    def __getitem__(self, idx):
-        return self.data_x[idx], self.data_y[idx]
+from config import (DATA_DIR, FEATURES, CLOSE_IDX, SEQ_LEN, TARGET_MODE,
+                    WALK_FORWARD_FOLDS, load_universe)
 
 
-class GlobalMmapDataset(Dataset):
-    """Memory-mapped Dataset for global training. Each cached stock's full,
-    pre-scaled history is mmapped from disk. The Dataset exposes one item per
-    valid (stock, start_offset) pair — exactly the same set of samples that
-    the eager `build_sequences` + concatenate path produces, in the same
-    order. Because mmap does not load the array into RAM until pages are
-    actually touched, memory footprint is O(index_size + working_set) instead
-    of O(total_dataset_size).
+# ---------------------------------------------------------------------------
+# Per-stock raw container
+# ---------------------------------------------------------------------------
+@dataclass
+class StockData:
+    ticker: str
+    dates: np.ndarray          # [N] np.datetime64[ns, UTC]
+    raw: np.ndarray            # [N, n_features] float64
+    close_raw: np.ndarray      # [N] float64 -- raw close for log-return target
+    raw_normed: np.ndarray     # [N, n_features] float32 (z-scored on train window)
+    mu: np.ndarray             # [n_features] train-window mean
+    sd: np.ndarray             # [n_features] train-window std
 
-    Args:
-        manifest_entries: list of dicts {"stock", "path", "n_rows", ...} —
-            one per cached stock, in the desired iteration order.
-        seq_len: lookback length.
-        horizon: prediction length.
-        close_idx: index of Close column in the cached arrays.
-    """
 
-    def __init__(self, manifest_entries, seq_len, horizon, close_idx):
-        self.seq_len = int(seq_len)
-        self.horizon = int(horizon)
-        self.close_idx = int(close_idx)
-
-        self._mmaps = []           # list of np.memmap, one per stock
-        # Compact index arrays (avoid Python list of tuples for memory)
-        mmap_idx_list = []
-        start_list = []
-
-        min_required = self.seq_len + self.horizon
-        for entry in manifest_entries:
-            n_rows = entry["n_rows"]
-            if n_rows < min_required:
-                continue  # match eager loader's filter exactly
-            arr = np.load(entry["path"], mmap_mode="r")
-            if arr.shape[0] != n_rows:
-                # manifest stale → trust the actual file
-                n_rows = arr.shape[0]
-            n_samples = n_rows - self.seq_len - self.horizon + 1
-            if n_samples <= 0:
-                continue
-            mmap_id = len(self._mmaps)
-            self._mmaps.append(arr)
-            mmap_idx_list.append(np.full(n_samples, mmap_id, dtype=np.int32))
-            # range(0, n_samples) — start offsets, stride=1, matches build_sequences
-            start_list.append(np.arange(n_samples, dtype=np.int64))
-
-        if not mmap_idx_list:
-            self._mmap_idx = np.zeros(0, dtype=np.int32)
-            self._start    = np.zeros(0, dtype=np.int64)
+def _load_stock(ticker: str, data_dir: str = None) -> StockData | None:
+    data_dir = data_dir or DATA_DIR
+    if data_dir is None:
+        raise RuntimeError("DATA_DIR not set. Run rebuild_merged_v2.py first.")
+    path = os.path.join(data_dir, f"{ticker}.csv")
+    if not os.path.exists(path):
+        alt = os.path.join(data_dir, f"{ticker.lower()}.csv")
+        if os.path.exists(alt):
+            path = alt
         else:
-            self._mmap_idx = np.concatenate(mmap_idx_list)
-            self._start    = np.concatenate(start_list)
-
-    def __len__(self):
-        return len(self._mmap_idx)
-
-    def __getitem__(self, idx):
-        m_id = int(self._mmap_idx[idx])
-        s = int(self._start[idx])
-        arr = self._mmaps[m_id]
-        # Cast away from memmap → contiguous float32 (cheap, just a copy of
-        # the slice, which is small relative to the model batch). Equivalent
-        # to indexing into the eager all_X / all_y arrays.
-        X = np.array(arr[s : s + self.seq_len], dtype=np.float32, copy=True)
-        y = np.array(
-            arr[s + self.seq_len : s + self.seq_len + self.horizon, self.close_idx],
-            dtype=np.float32,
-            copy=True,
-        )
-        return X, y
-
-
-class ValTestMmapDataset(Dataset):
-    """Memory-mapped Dataset for val OR test split. Each cached test stock has
-    pre-scaled val and test arrays on disk (`<stock>__val.npy`, `<stock>__test.npy`),
-    produced by `preprocess_global_cache.py --valtest`. The split argument
-    selects which set to expose. Sample order matches the eager
-    `get_val_test_loaders` exactly: stocks in NAMES_50 lower-case order, then
-    within each stock by start_offset (stride=1).
-    """
-
-    def __init__(self, manifest_entries, seq_len, horizon, close_idx, split):
-        assert split in ("val", "test"), split
-        self.seq_len = int(seq_len)
-        self.horizon = int(horizon)
-        self.close_idx = int(close_idx)
-        self.split = split
-        self._mmaps = []
-        # Per-sample inverse-scale arrays (one entry per sample) so the
-        # evaluator can compute dollar-space metrics. close_min/max come
-        # from the val period scaler (same scaler that scaled both val and test).
-        close_min_per_sample = []
-        close_max_per_sample = []
-        mmap_idx_list = []
-        start_list = []
-
-        path_key = f"{split}_path"
-        rows_key = f"{split}_n_rows"
-        # Cache may contain a lookback prefix; only generate samples whose
-        # TARGET falls in the actual val/test window (i.e. target_idx >=
-        # first_predict_idx). Older caches without this field default to 0.
-        first_predict_key = f"{split}_first_predict_idx"
-        min_required = self.seq_len + self.horizon
-        for entry in manifest_entries:
-            n_rows = entry[rows_key]
-            if n_rows < min_required:
-                continue
-            arr = np.load(entry[path_key], mmap_mode="r")
-            first_predict_idx = int(entry.get(first_predict_key, 0))
-            # First valid sample index i must satisfy i + seq_len >= first_predict_idx
-            i_min = max(0, first_predict_idx - self.seq_len)
-            n_samples_total = arr.shape[0] - self.seq_len - self.horizon + 1
-            if n_samples_total <= i_min:
-                continue
-            n_samples = n_samples_total - i_min
-            mmap_id = len(self._mmaps)
-            self._mmaps.append(arr)
-            mmap_idx_list.append(np.full(n_samples, mmap_id, dtype=np.int32))
-            start_list.append(np.arange(i_min, n_samples_total, dtype=np.int64))
-            close_min_per_sample.append(np.full(n_samples, entry["close_min"], dtype=np.float32))
-            close_max_per_sample.append(np.full(n_samples, entry["close_max"], dtype=np.float32))
-
-        if not mmap_idx_list:
-            self._mmap_idx = np.zeros(0, dtype=np.int32)
-            self._start    = np.zeros(0, dtype=np.int64)
-            self.close_min = np.zeros(0, dtype=np.float32)
-            self.close_max = np.zeros(0, dtype=np.float32)
-        else:
-            self._mmap_idx = np.concatenate(mmap_idx_list)
-            self._start    = np.concatenate(start_list)
-            self.close_min = np.concatenate(close_min_per_sample)
-            self.close_max = np.concatenate(close_max_per_sample)
-
-    def __len__(self):
-        return len(self._mmap_idx)
-
-    def __getitem__(self, idx):
-        m_id = int(self._mmap_idx[idx])
-        s = int(self._start[idx])
-        arr = self._mmaps[m_id]
-        X = np.array(arr[s : s + self.seq_len], dtype=np.float32, copy=True)
-        y = np.array(
-            arr[s + self.seq_len : s + self.seq_len + self.horizon, self.close_idx],
-            dtype=np.float32,
-            copy=True,
-        )
-        return X, y
-
-
-def _find_csv(stock: str) -> str:
-    for name in [stock, stock.upper(), stock.lower()]:
-        p = os.path.join(DATA_DIR, f"{name}.csv")
-        if os.path.exists(p):
-            return p
-    pattern = os.path.join(DATA_DIR, f"{stock.lower()}*.csv")
-    matches = glob.glob(pattern)
-    if matches:
-        return matches[0]
-    raise FileNotFoundError(f"No CSV found for '{stock}' in {DATA_DIR}")
-
-def _load_raw(stock: str, feature_cols: list) -> np.ndarray:
-    """Load raw features (no dates returned). Backward-compatible signature
-    used by the global training cache. For val/test calendar-date splits,
-    use `_load_raw_with_dates` instead."""
-    data, _ = _load_raw_with_dates(stock, feature_cols)
-    return data
-
-
-def _load_raw_with_dates(stock: str, feature_cols: list):
-    """Load raw features AND aligned date array. Both have the same N rows
-    after NaN drop, in chronological order. Used by calendar-date split."""
-    path = _find_csv(stock)
+            return None
     df = pd.read_csv(path, low_memory=False)
-
-    df.columns = [c.strip().title().replace(" ", "_") for c in df.columns]
-
-    for old, new in {
-        "Adj_Close": "Close", "Adj_close": "Close",
-        "Scaled_Sentiment": "scaled_sentiment"
-    }.items():
-        if old in df.columns and new not in df.columns:
-            df = df.rename(columns={old: new})
-        elif old in df.columns and new in df.columns:
-            df = df.drop(columns=[old])
-
-    if "Date" in df.columns:
-        df["Date"] = pd.to_datetime(df["Date"], utc=True, errors="coerce")
-        df = df.sort_values("Date").reset_index(drop=True)
-
-    result = []
-    for col in feature_cols:
+    if "Date" not in df.columns:
+        return None
+    df["Date"] = pd.to_datetime(df["Date"], utc=True, errors="coerce")
+    df = df.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
+    feats = []
+    for col in FEATURES:
         if col in df.columns:
-            result.append(df[col].values)
-            continue
-        match = [c for c in df.columns if c.lower() == col.lower()]
-        if match:
-            result.append(df[match[0]].values)
-            continue
-        if "sentiment" in col.lower():
-            fill = 0.5 if "scaled" in col.lower() else 0.0
-            result.append(np.full(len(df), fill, dtype=float))
+            feats.append(df[col].astype(np.float64).values)
+        elif "sentiment" in col.lower():
+            feats.append(np.full(len(df), 0.5))
         else:
-            raise ValueError(f"Column '{col}' not found in dataframe.")
-
-    data = np.column_stack(result).astype(float)
-    mask = ~np.any(np.isnan(data), axis=1)
-    data = data[mask]
-
-    if "Date" in df.columns:
-        dates = df["Date"].values[mask]
-    else:
-        # No date column → return None; caller must handle (calendar split impossible)
-        dates = None
-    return data, dates
+            raise RuntimeError(f"{ticker}: missing required column '{col}'")
+    raw = np.column_stack(feats)
+    valid = ~np.any(np.isnan(raw), axis=1)
+    raw = raw[valid]
+    dates = df["Date"].values[valid]
+    if len(raw) < 100:
+        return None
+    return StockData(ticker=ticker, dates=dates, raw=raw,
+                     close_raw=raw[:, CLOSE_IDX].copy(),
+                     raw_normed=None, mu=None, sd=None)
 
 
-def calendar_split(data, dates, val_start, test_start, lookback_rows=0):
-    """Split (data, dates) into val/test arrays with optional `lookback_rows`
-    of historical context PREPENDED to each window. The split semantics are:
+# ---------------------------------------------------------------------------
+# Fold lookup
+# ---------------------------------------------------------------------------
+def get_fold_dates(fold_name: str) -> dict:
+    for fold in WALK_FORWARD_FOLDS:
+        if fold["name"] == fold_name:
+            ty = int(fold["test_year"]); vy = int(fold["val_year"])
+            return {
+                "train_end":  pd.Timestamp(fold["train_end"], tz="UTC"),
+                "val_start":  pd.Timestamp(f"{vy}-01-01", tz="UTC"),
+                "val_end":    pd.Timestamp(f"{vy}-12-31", tz="UTC"),
+                "test_start": pd.Timestamp(f"{ty}-01-01", tz="UTC"),
+                "test_end":   pd.Timestamp(f"{ty}-12-31", tz="UTC"),
+            }
+    raise KeyError(f"Unknown fold {fold_name!r}")
 
-      val_data   = up to `lookback_rows` rows immediately preceding val_start
-                 + all rows in [val_start, test_start)
-      test_data  = up to `lookback_rows` rows immediately preceding test_start
-                 + all rows from test_start onwards
 
-    Each returned array also reports `first_predict_idx` — the row offset at
-    which the actual val/test window begins (so sample-builders can skip
-    samples whose targets fall in the lookback prefix).
+# ---------------------------------------------------------------------------
+# Per-stock fit & sample-index build
+# ---------------------------------------------------------------------------
+def _fit_normalise_and_index(stk: StockData, seq_len: int, horizon: int,
+                              fold_dates: dict, target_mode: str,
+                              min_close: float = 1e-6):
+    """Fit per-stock z-score on train rows, fill stk.raw_normed, and return
+    per-split index arrays of valid sample START offsets.
 
-    Returns
-    -------
-    (val_data, val_first_predict_idx, test_data, test_first_predict_idx)
+    A sample starts at index i; its anchor date is dates[i+seq_len-1] and
+    target is at dates[i+seq_len+horizon-1].
     """
-    if dates is None:
-        raise ValueError("calendar_split requires dates; CSV missing 'Date' column.")
-    val_start_ts  = pd.to_datetime(val_start,  utc=True)
-    test_start_ts = pd.to_datetime(test_start, utc=True)
+    N = stk.raw.shape[0]
+    if N < seq_len + horizon:
+        return None
 
-    # Convert dates (numpy datetime64) to pandas timestamps for comparison.
-    # pd.to_datetime returns DatetimeIndex; comparison gives ndarray of bool.
-    dates_pd = pd.to_datetime(dates, utc=True)
-    val_mask_arr = np.asarray(dates_pd >= val_start_ts)
-    test_mask_arr = np.asarray(dates_pd >= test_start_ts)
-    val_start_idx_full  = int(np.argmax(val_mask_arr))  if val_mask_arr.any()  else len(dates)
-    test_start_idx_full = int(np.argmax(test_mask_arr)) if test_mask_arr.any() else len(dates)
+    dates_pd = pd.to_datetime(stk.dates, utc=True)
+    train_mask_rows = dates_pd <= fold_dates["train_end"]
 
-    # Val: rows immediately before val_start (lookback) + rows in [val_start, test_start)
-    val_lo = max(0, val_start_idx_full - lookback_rows)
-    val_hi = test_start_idx_full
-    val_data = data[val_lo:val_hi]
-    val_first_predict_idx = val_start_idx_full - val_lo  # offset of first actual-val row in val_data
+    train_rows = stk.raw[train_mask_rows]
+    if train_rows.shape[0] < seq_len + horizon:
+        return None
+    mu = train_rows.mean(axis=0)
+    sd = train_rows.std(axis=0)
+    sd[sd < 1e-9] = 1.0
+    stk.mu = mu; stk.sd = sd
+    stk.raw_normed = ((stk.raw - mu) / sd).astype(np.float32)
 
-    # Test: rows immediately before test_start (lookback) + rows from test_start to end
-    test_lo = max(0, test_start_idx_full - lookback_rows)
-    test_data = data[test_lo:]
-    test_first_predict_idx = test_start_idx_full - test_lo
+    # Determine which i's are valid for each split (by anchor date)
+    train_idx, val_idx, test_idx = [], [], []
+    for i in range(0, N - seq_len - horizon + 1):
+        anchor_idx = i + seq_len - 1
+        target_idx = i + seq_len + horizon - 1
+        anchor_date = dates_pd[anchor_idx]
+        # Filter on close-price validity for log-return target
+        if target_mode == "log_return":
+            ac = stk.close_raw[anchor_idx]; tc = stk.close_raw[target_idx]
+            if ac <= min_close or tc <= min_close:
+                continue
+        if anchor_date <= fold_dates["train_end"]:
+            train_idx.append(i)
+        elif fold_dates["val_start"] <= anchor_date <= fold_dates["val_end"]:
+            val_idx.append(i)
+        elif fold_dates["test_start"] <= anchor_date <= fold_dates["test_end"]:
+            test_idx.append(i)
+        # else: gap year between train_end and val_start -> skip
+    return {"train": np.array(train_idx, dtype=np.int32),
+            "val":   np.array(val_idx, dtype=np.int32),
+            "test":  np.array(test_idx, dtype=np.int32)}
 
-    return val_data, int(val_first_predict_idx), test_data, int(test_first_predict_idx)
 
-def build_sequences(data: np.ndarray, seq_len: int, horizon: int, close_idx: int, stride: int = 1):
-    X, y = [], []
-    for i in range(0, len(data) - seq_len - horizon + 1, stride):
-        X.append(data[i : i + seq_len])
-        y.append(data[i + seq_len : i + seq_len + horizon, close_idx])
-    return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
+# ---------------------------------------------------------------------------
+# Lazy on-the-fly Dataset
+# ---------------------------------------------------------------------------
+class LazyStockDataset(Dataset):
+    """Memory-efficient sample-on-demand dataset.
 
+    Backing storage: a tuple (raw_normed_per_stock, close_raw_per_stock,
+    sample_table). sample_table is a [N, 3] int32 array of
+    (stock_id, start_offset, anchor_offset) where:
+        stock_id    -> index into the per-stock list
+        start_offset = i (where the input window begins)
+        anchor_offset = i + seq_len - 1 (last input day)
+    """
+
+    def __init__(self, raw_normed_list, close_raw_list, sample_table,
+                 seq_len, horizon, target_mode):
+        self.raw_normed_list = raw_normed_list  # list of [N_s, F] float32
+        self.close_raw_list = close_raw_list    # list of [N_s] float64
+        self.sample_table = sample_table        # [N, 3] int32
+        self.seq_len = int(seq_len)
+        self.horizon = int(horizon)
+        self.target_mode = target_mode
+
+    def __len__(self):
+        return self.sample_table.shape[0]
+
+    def __getitem__(self, idx):
+        stock_id = int(self.sample_table[idx, 0])
+        i = int(self.sample_table[idx, 1])
+        raw_normed = self.raw_normed_list[stock_id]
+        X = raw_normed[i : i + self.seq_len]            # [seq_len, F]
+        if self.target_mode == "log_return":
+            close = self.close_raw_list[stock_id]
+            anchor_idx = i + self.seq_len - 1
+            target_idx = i + self.seq_len + self.horizon - 1
+            y = np.float32(np.log(close[target_idx] / close[anchor_idx]))
+        elif self.target_mode == "scaled_price":
+            # Return the H-step normalised close window
+            y = raw_normed[i + self.seq_len : i + self.seq_len + self.horizon, CLOSE_IDX].astype(np.float32)
+        else:
+            raise ValueError(f"Unknown target_mode {self.target_mode!r}")
+        return X.copy(), y
+
+
+# ---------------------------------------------------------------------------
+# UnifiedDataLoader (v2 entrypoint, lazy)
+# ---------------------------------------------------------------------------
 class UnifiedDataLoader:
-    def __init__(self, seq_len=SEQ_LEN, horizon=10, batch_size=128, max_stocks=None):
-        self.seq_len = seq_len
-        self.horizon = horizon
-        self.batch_size = batch_size
-        self.all_stocks = [os.path.basename(f).replace('.csv', '') for f in glob.glob(os.path.join(DATA_DIR, "*.csv"))]
+    """Build train/val/test PyTorch DataLoaders for one walk-forward fold.
 
-        self.test_stocks = [s.lower() for s in NAMES_50]
-        self.train_stocks = [s for s in self.all_stocks if s.lower() not in self.test_stocks]
+    Stores per-stock raw_normed + close_raw arrays in RAM (~55 MB total
+    for 300 stocks). Samples are produced lazily in __getitem__ -- no
+    materialised sample tensor.
+    """
 
-        if max_stocks is not None:
-            self.train_stocks = self.train_stocks[:max_stocks]
-            print(f"[max_stocks={max_stocks}] Using {len(self.train_stocks)} training stock(s) for timing test.")
+    def __init__(self, seq_len: int = SEQ_LEN, horizon: int = 5,
+                 batch_size: int = 128, fold: str = "F4",
+                 max_stocks: int | None = None,
+                 target_mode: str = None,
+                 num_workers: int = 0,
+                 universe_file: str = None):
+        self.seq_len = int(seq_len)
+        self.horizon = int(horizon)
+        self.batch_size = int(batch_size)
+        self.fold = fold
+        self.fold_dates = get_fold_dates(fold)
+        self.target_mode = target_mode or TARGET_MODE
+        self.num_workers = int(num_workers)
 
-        self.test_stock_scalers = {}
+        universe = load_universe(universe_file) if universe_file else load_universe()
+        if max_stocks:
+            universe = universe[:max_stocks]
+        self.universe = universe
 
-    def get_global_train_loader(self):
-        all_X, all_y = [], []
-        for stock in self.train_stocks:
-            try:
-                data = _load_raw(stock, FEATURES)
-                if len(data) < self.seq_len + self.horizon:
+        self.raw_normed_list = []      # one [N_s, F] float32 per stock
+        self.close_raw_list = []       # one [N_s] float64 per stock
+        self.scalers = {}              # {ticker: (mu, sd)}
+        self.skipped = []
+        # Per-split sample tables: rows = (stock_id, start_offset, anchor_offset)
+        train_rows, val_rows, test_rows = [], [], []
+        train_stock_id, val_stock_id, test_stock_id = [], [], []
+        train_anchor, val_anchor, test_anchor = [], [], []
+
+        for ticker in universe:
+            stk = _load_stock(ticker)
+            if stk is None:
+                self.skipped.append(ticker); continue
+            res = _fit_normalise_and_index(stk, self.seq_len, self.horizon,
+                                            self.fold_dates, self.target_mode)
+            if res is None or len(res["train"]) == 0:
+                self.skipped.append(ticker); continue
+            sid = len(self.raw_normed_list)
+            self.raw_normed_list.append(stk.raw_normed)
+            self.close_raw_list.append(stk.close_raw)
+            self.scalers[ticker] = (stk.mu, stk.sd)
+            for i_arr, rows, sids, anchors in [
+                (res["train"], train_rows, train_stock_id, train_anchor),
+                (res["val"],   val_rows,   val_stock_id,   val_anchor),
+                (res["test"],  test_rows,  test_stock_id,  test_anchor),
+            ]:
+                if len(i_arr) == 0:
                     continue
-                scaler = MinMaxScaler(feature_range=(0, 1))
-                data = scaler.fit_transform(data)
-                X, y = build_sequences(data, self.seq_len, self.horizon, CLOSE_IDX)
-                if len(X) > 0:
-                    all_X.append(X)
-                    all_y.append(y)
-            except Exception as e:
-                pass
-        
-        if len(all_X) == 0:
-            raise ValueError("No training data found.")
+                rows.append(np.column_stack([
+                    np.full(len(i_arr), sid, dtype=np.int32),
+                    i_arr.astype(np.int32),
+                    (i_arr + self.seq_len - 1).astype(np.int32),
+                ]))
+                sids.append(np.full(len(i_arr), sid, dtype=np.int32))
+                anchors.append((i_arr + self.seq_len - 1).astype(np.int32))
 
-        final_X = np.concatenate(all_X)
-        final_y = np.concatenate(all_y)
-        dataset = TS_Dataset(final_X, final_y)
-        return DataLoader(dataset, batch_size=self.batch_size, shuffle=True, drop_last=False)
+        def _vstack(rows): return np.concatenate(rows, axis=0) if rows else np.zeros((0, 3), dtype=np.int32)
+        def _vec(rows): return np.concatenate(rows, axis=0) if rows else np.zeros(0, dtype=np.int32)
 
-    def get_sequential_train_loaders(self):
-        """Eager list-build (legacy). Holds ALL stock DataLoaders in memory at once.
-        On 16 GB RAM with SEQ_LEN=504 + ~300 stocks this exceeds capacity. Prefer
-        `iter_train_loaders()` which yields one loader at a time.
-        """
-        loaders = []
-        for stock in self.train_stocks:
-            try:
-                data = _load_raw(stock, FEATURES)
-                if len(data) < self.seq_len + self.horizon:
-                    continue
-                scaler = MinMaxScaler(feature_range=(0, 1))
-                data = scaler.fit_transform(data)
-                X, y = build_sequences(data, self.seq_len, self.horizon, CLOSE_IDX)
-                if len(X) > 0:
-                    dataset = TS_Dataset(X, y)
-                    loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True, drop_last=False)
-                    loaders.append(loader)
-            except:
-                pass
-        return loaders
+        self.sample_table_train = _vstack(train_rows)
+        self.sample_table_val   = _vstack(val_rows)
+        self.sample_table_test  = _vstack(test_rows)
+        self.train_stock_id = _vec(train_stock_id)
+        self.val_stock_id   = _vec(val_stock_id)
+        self.test_stock_id  = _vec(test_stock_id)
+        self.train_anchor_idx = _vec(train_anchor)
+        self.val_anchor_idx   = _vec(val_anchor)
+        self.test_anchor_idx  = _vec(test_anchor)
 
-    def iter_train_loaders(self):
-        """Generator yielding one stock's DataLoader at a time. Scientifically
-        equivalent to `get_sequential_train_loaders()` (same data, same order,
-        same per-loader RNG behaviour) but with O(1) memory footprint instead
-        of O(N_stocks) — only one stock's sequences are in memory at any moment.
-        """
-        for stock in self.train_stocks:
-            try:
-                data = _load_raw(stock, FEATURES)
-                if len(data) < self.seq_len + self.horizon:
-                    continue
-                scaler = MinMaxScaler(feature_range=(0, 1))
-                data = scaler.fit_transform(data)
-                X, y = build_sequences(data, self.seq_len, self.horizon, CLOSE_IDX)
-                if len(X) > 0:
-                    dataset = TS_Dataset(X, y)
-                    loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True, drop_last=False)
-                    yield loader
-            except:
-                pass
+        # Convenience attributes (eagerly compute targets for diagnostic
+        # use; this is small -- one float per sample, so n_train * 4 bytes).
+        self.y_train = self._compute_targets(self.sample_table_train)
+        self.y_val   = self._compute_targets(self.sample_table_val)
+        self.y_test  = self._compute_targets(self.sample_table_test)
 
-    def get_global_train_loader_mmap(self, cache_dir=None, num_workers=0):
-        """Memory-mapped global loader. Scientifically equivalent to
-        `get_global_train_loader()` (same per-stock scaling, same sample order,
-        same DataLoader shuffle behaviour) but with bounded memory because
-        each cached stock is held only via numpy.memmap rather than fully
-        materialised into RAM.
+    def _compute_targets(self, sample_table):
+        """Eagerly compute the y vector for diagnostics. Lightweight (one
+        float per sample). For target_mode='log_return' returns [N];
+        for 'scaled_price' returns the empty array (computed in
+        __getitem__)."""
+        if self.target_mode != "log_return":
+            return np.zeros(sample_table.shape[0], dtype=np.float32)
+        if sample_table.shape[0] == 0:
+            return np.zeros(0, dtype=np.float32)
+        out = np.zeros(sample_table.shape[0], dtype=np.float32)
+        for n in range(sample_table.shape[0]):
+            sid = int(sample_table[n, 0])
+            i = int(sample_table[n, 1])
+            close = self.close_raw_list[sid]
+            ac = close[i + self.seq_len - 1]
+            tc = close[i + self.seq_len + self.horizon - 1]
+            out[n] = float(np.log(tc / ac))
+        return out
 
-        Pre-condition: run `python preprocess_global_cache.py` first.
+    @property
+    def X_train(self):
+        # Compatibility alias for tests; LAZY -- accessing this returns a
+        # virtual proxy with a length and shape but no materialised data.
+        return _LazyShapeProxy(self.sample_table_train.shape[0],
+                                (self.seq_len, len(FEATURES)))
 
-        Args:
-            cache_dir: location of pre-scaled .npy files. Defaults to CACHE_DIR.
-            num_workers: passed through to DataLoader.
+    @property
+    def X_val(self):
+        return _LazyShapeProxy(self.sample_table_val.shape[0],
+                                (self.seq_len, len(FEATURES)))
 
-        Returns:
-            DataLoader yielding (X, y) batches with shapes
-            ([B, seq_len, n_features], [B, horizon]).
-        """
-        cache_dir = cache_dir or CACHE_DIR
-        manifest_path = os.path.join(cache_dir, "manifest.json")
-        if not os.path.exists(manifest_path):
-            raise FileNotFoundError(
-                f"No manifest at {manifest_path}. Run "
-                f"`python preprocess_global_cache.py` first."
-            )
-        with open(manifest_path) as f:
-            manifest = json.load(f)
+    @property
+    def X_test(self):
+        return _LazyShapeProxy(self.sample_table_test.shape[0],
+                                (self.seq_len, len(FEATURES)))
 
-        # Restrict to the train_stocks set (which already excludes NAMES_50
-        # and respects --max_stocks).
-        train_set = set(self.train_stocks)
-        cached_entries = [m for m in manifest["stocks"] if m["stock"] in train_set]
-        # Preserve self.train_stocks order (matches eager loader iteration)
-        order = {s: i for i, s in enumerate(self.train_stocks)}
-        cached_entries.sort(key=lambda m: order[m["stock"]])
+    def __repr__(self):
+        return (f"UnifiedDataLoader(fold={self.fold}, seq_len={self.seq_len}, "
+                f"horizon={self.horizon}, n_stocks={len(self.universe)-len(self.skipped)}/"
+                f"{len(self.universe)}, n_train={self.sample_table_train.shape[0]}, "
+                f"n_val={self.sample_table_val.shape[0]}, "
+                f"n_test={self.sample_table_test.shape[0]}, "
+                f"target_mode={self.target_mode}, lazy=True)")
 
-        dataset = GlobalMmapDataset(
-            cached_entries, self.seq_len, self.horizon, CLOSE_IDX
-        )
-        if len(dataset) == 0:
-            raise ValueError(
-                "GlobalMmapDataset is empty. Either no stocks meet the "
-                "min-length requirement for this horizon, or the cache is "
-                "stale — try `python preprocess_global_cache.py --force`."
-            )
-        return DataLoader(
-            dataset,
-            batch_size=self.batch_size,
-            shuffle=True,
-            drop_last=False,
-            num_workers=num_workers,
-            pin_memory=True,
-        )
+    def _make_loader(self, sample_table, shuffle):
+        ds = LazyStockDataset(self.raw_normed_list, self.close_raw_list,
+                               sample_table, self.seq_len, self.horizon,
+                               self.target_mode)
+        return DataLoader(ds, batch_size=self.batch_size, shuffle=shuffle,
+                           num_workers=self.num_workers, pin_memory=True)
 
-    def get_val_test_loaders_mmap(self, cache_dir=None, num_workers=0):
-        """Memory-mapped val/test loaders. Bit-for-bit equivalent to
-        `get_val_test_loaders` (same per-stock half/half split, same val-fit
-        scaler applied to both halves, same sample order) but with bounded
-        memory: only mmap pages, plus a compact per-sample close_min/max
-        array, are resident at any time.
+    def get_train_loader(self, shuffle: bool = True) -> DataLoader:
+        return self._make_loader(self.sample_table_train, shuffle)
 
-        Pre-condition: `python preprocess_global_cache.py --valtest`.
+    def get_val_loader(self) -> DataLoader:
+        return self._make_loader(self.sample_table_val, False)
 
-        Sets `self.test_close_min/max` and `self.val_close_min/max` so the
-        evaluator can compute dollar-space metrics, identical to the eager
-        loader's exposed attributes.
-        """
-        cache_dir = cache_dir or VALTEST_CACHE_DIR
-        manifest_path = os.path.join(cache_dir, "manifest.json")
-        if not os.path.exists(manifest_path):
-            raise FileNotFoundError(
-                f"No val/test manifest at {manifest_path}. Run "
-                f"`python preprocess_global_cache.py --only-valtest` first."
-            )
-        with open(manifest_path) as f:
-            manifest = json.load(f)
-        entries = manifest["stocks"]
+    def get_test_loader(self) -> DataLoader:
+        return self._make_loader(self.sample_table_test, False)
 
-        v_ds = ValTestMmapDataset(entries, self.seq_len, self.horizon, CLOSE_IDX, split="val")
-        t_ds = ValTestMmapDataset(entries, self.seq_len, self.horizon, CLOSE_IDX, split="test")
+    def get_train_val_test_loaders(self):
+        return (self.get_train_loader(), self.get_val_loader(), self.get_test_loader())
 
-        val_loader = (DataLoader(v_ds, batch_size=self.batch_size, shuffle=False,
-                                 num_workers=num_workers, pin_memory=True)
-                      if len(v_ds) > 0 else None)
-        test_loader = (DataLoader(t_ds, batch_size=self.batch_size, shuffle=False,
-                                  num_workers=num_workers, pin_memory=True)
-                       if len(t_ds) > 0 else None)
 
-        # Expose inverse-scale arrays — same attribute names as eager path.
-        self.val_close_min = v_ds.close_min if len(v_ds) > 0 else None
-        self.val_close_max = v_ds.close_max if len(v_ds) > 0 else None
-        self.test_close_min = t_ds.close_min if len(t_ds) > 0 else None
-        self.test_close_max = t_ds.close_max if len(t_ds) > 0 else None
+class _LazyShapeProxy:
+    """Tiny proxy so existing tests can call `len(loader.X_train)` etc.
+    without materialising the 10 GB tensor. Not iterable; use the
+    DataLoader for actual iteration."""
+    def __init__(self, n: int, sample_shape: tuple):
+        self.n = int(n)
+        self.shape = (self.n,) + tuple(sample_shape)
+    def __len__(self):
+        return self.n
 
-        return val_loader, test_loader
 
-    def get_val_test_loaders(self):
-        val_X,  val_y = [], []
-        test_X, test_y = [], []
-        # Per-sample Close-feature min/max arrays so we can inverse_transform
-        # predictions back to dollars in the evaluator (for the unscaled metrics).
-        # Each test sample comes from one specific stock and that stock's scaler
-        # determines its close_min/close_max. Preserves order — test_loader has
-        # shuffle=False so positions match.
-        test_close_min = []
-        test_close_max = []
-        val_close_min = []
-        val_close_max = []
-        self.test_stock_scalers = {}
+# ---------------------------------------------------------------------------
+# Eager helper (deprecated; kept for tests that need a small materialised
+# slice). Returns (X_concat, y_concat) for the requested split.
+# ---------------------------------------------------------------------------
+def materialise_split(ld: UnifiedDataLoader, split: str, max_samples: int = None):
+    """Materialise up to max_samples for the given split. Used in tests."""
+    sample_table = {"train": ld.sample_table_train,
+                    "val":   ld.sample_table_val,
+                    "test":  ld.sample_table_test}[split]
+    n = sample_table.shape[0] if max_samples is None else min(sample_table.shape[0], max_samples)
+    X = np.zeros((n, ld.seq_len, len(FEATURES)), dtype=np.float32)
+    y = np.zeros(n, dtype=np.float32)
+    for k in range(n):
+        sid = int(sample_table[k, 0])
+        i = int(sample_table[k, 1])
+        X[k] = ld.raw_normed_list[sid][i : i + ld.seq_len]
+        if ld.target_mode == "log_return":
+            close = ld.close_raw_list[sid]
+            ac = close[i + ld.seq_len - 1]
+            tc = close[i + ld.seq_len + ld.horizon - 1]
+            y[k] = float(np.log(tc / ac))
+    return X, y
 
-        min_required = self.seq_len + self.horizon
-        # Calendar-aware lookback: include `seq_len` trading days of history
-        # before each window's start so the FIRST predictable sample's target
-        # is exactly at val_start (and test_start).
-        lookback_rows = self.seq_len
-        for stock in self.test_stocks:
-            try:
-                data, dates = _load_raw_with_dates(stock, FEATURES)
-                if dates is None:
-                    # Fall back to legacy 50/50 if no Date column (should not happen on FNSPID)
-                    if len(data) < min_required * 2:
-                        continue
-                    half_idx = int(len(data) * 0.5)
-                    val_data = data[:half_idx]
-                    test_data = data[half_idx:]
-                    val_first = test_first = 0
-                else:
-                    # Calendar-date split with lookback prefix.
-                    val_data, val_first, test_data, test_first = calendar_split(
-                        data, dates, VAL_START_DATE, TEST_START_DATE, lookback_rows=lookback_rows)
-                    if len(val_data) < min_required or len(test_data) < min_required:
-                        continue  # not enough data in either window for this stock
 
-                scaler = MinMaxScaler(feature_range=(0, 1))
-                val_data = scaler.fit_transform(val_data)
-                test_data = scaler.transform(test_data)
-                self.test_stock_scalers[stock] = scaler
-
-                close_min = scaler.data_min_[CLOSE_IDX]
-                close_max = scaler.data_max_[CLOSE_IDX]
-
-                X_v, y_v = build_sequences(val_data, self.seq_len, self.horizon, CLOSE_IDX)
-                X_t, y_t = build_sequences(test_data, self.seq_len, self.horizon, CLOSE_IDX)
-
-                if len(X_v) > 0:
-                    val_X.append(X_v)
-                    val_y.append(y_v)
-                    val_close_min.append(np.full(len(X_v), close_min, dtype=np.float32))
-                    val_close_max.append(np.full(len(X_v), close_max, dtype=np.float32))
-                if len(X_t) > 0:
-                    test_X.append(X_t)
-                    test_y.append(y_t)
-                    test_close_min.append(np.full(len(X_t), close_min, dtype=np.float32))
-                    test_close_max.append(np.full(len(X_t), close_max, dtype=np.float32))
-            except Exception as e:
-                print(f"Skipping val/test for {stock}: {e}")
-
-        v_ds = TS_Dataset(np.concatenate(val_X), np.concatenate(val_y)) if len(val_X) > 0 else None
-        t_ds = TS_Dataset(np.concatenate(test_X), np.concatenate(test_y)) if len(test_X) > 0 else None
-
-        val_loader = DataLoader(v_ds, batch_size=self.batch_size, shuffle=False) if v_ds else None
-        test_loader = DataLoader(t_ds, batch_size=self.batch_size, shuffle=False) if t_ds else None
-
-        # Expose per-sample inverse-scale info for evaluator
-        self.test_close_min = np.concatenate(test_close_min) if test_close_min else None
-        self.test_close_max = np.concatenate(test_close_max) if test_close_max else None
-        self.val_close_min = np.concatenate(val_close_min) if val_close_min else None
-        self.val_close_max = np.concatenate(val_close_max) if val_close_max else None
-
-        return val_loader, test_loader
+# ---------------------------------------------------------------------------
+# Backward-compat wrapper for older code paths that called
+# build_samples_for_stock(...) -- delegate to the new fit/index function.
+# ---------------------------------------------------------------------------
+def build_samples_for_stock(stk: StockData, seq_len: int, horizon: int,
+                             fold_dates: dict, target_mode: str = "log_return"):
+    """Convenience: returns same dict as v1 (for tests)."""
+    res = _fit_normalise_and_index(stk, seq_len, horizon, fold_dates, target_mode)
+    if res is None:
+        return None
+    # Build small materialised samples (test-only, slow path)
+    def _make(idx_arr):
+        n = len(idx_arr)
+        X = np.zeros((n, seq_len, len(FEATURES)), dtype=np.float32)
+        y_logret = np.zeros(n, dtype=np.float32)
+        anchors = np.zeros(n, dtype=np.int32)
+        for k, i in enumerate(idx_arr):
+            X[k] = stk.raw_normed[i : i + seq_len]
+            ac = stk.close_raw[i + seq_len - 1]
+            tc = stk.close_raw[i + seq_len + horizon - 1]
+            y_logret[k] = float(np.log(tc / ac))
+            anchors[k] = i + seq_len - 1
+        return X, y_logret, anchors
+    Xt, yt, at = _make(res["train"])
+    Xv, yv, av = _make(res["val"])
+    Xs, ys, as_ = _make(res["test"])
+    return {
+        "X_train": Xt, "y_train": yt, "anchor_train": at,
+        "X_val":   Xv, "y_val":   yv, "anchor_val":   av,
+        "X_test":  Xs, "y_test":  ys, "anchor_test":  as_,
+        "mu": stk.mu, "sd": stk.sd,
+        "n_train": int(len(Xt)),
+        "n_val":   int(len(Xv)),
+        "n_test":  int(len(Xs)),
+    }

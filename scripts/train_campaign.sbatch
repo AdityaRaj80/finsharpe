@@ -1,13 +1,13 @@
 #!/bin/bash
 #SBATCH --job-name=fs_train
-#SBATCH --partition=gpu_h100_4
-#SBATCH --qos=qos_gpu_h100
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
+#SBATCH --mem=48G
 #SBATCH --time=06:00:00
 #SBATCH --output=/home/goyalpoonam/logs/fs_%x_%j.out
 #SBATCH --error=/home/goyalpoonam/logs/fs_%x_%j.err
+# NOTE: --partition and --qos are passed by submit_campaign_v2.sh
+# (round-robin across H100/H200/A100 to maximise concurrent throughput).
 
 # Generic training submission for the dual-arm benchmark campaign.
 #
@@ -29,9 +29,9 @@ cd "$REPO_DIR"
 source /apps/spack/opt/spack/linux-rocky8-zen2/gcc-11.2.0/anaconda3-2023.09-0-ku6kdpolxwbdydg5xyawasvogquyjj4b/etc/profile.d/conda.sh
 conda activate sr_opt
 
-echo "[$(date)] node=$(hostname) job=$SLURM_JOB_ID"
-echo "[$(date)] gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
-echo "[$(date)] cell: model=$MODEL horizon=$HORIZON fold=$FOLD arm=$ARM"
+echo "[$(date)] node=$(hostname) job=$SLURM_JOB_ID partition=$SLURM_JOB_PARTITION"
+echo "[$(date)] gpu=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -1)"
+echo "[$(date)] cell: model=$MODEL horizon=$HORIZON fold=$FOLD arm=$ARM batch_size=${BATCH_SIZE:-128}"
 
 # Build train.py invocation. For Track-B arm we add --use_risk_head.
 ARM_FLAGS=""
@@ -44,7 +44,7 @@ python train.py \
     --horizon "$HORIZON" \
     --fold "$FOLD" \
     --method global \
-    --batch_size 128 \
+    --batch_size "${BATCH_SIZE:-128}" \
     --epochs 60 \
     --lr 1e-4 \
     --patience 10 \

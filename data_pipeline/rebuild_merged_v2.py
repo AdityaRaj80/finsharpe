@@ -16,9 +16,25 @@ Output schema (per stock, sorted by Date):
 Merging rules:
   * Left-join price rows (every trading day in 2009-2023) with daily
     sentiment on Date.
-  * Days with NO news article: scaled_sentiment = 0.5 (neutral fill,
-    well-defined "no signal" prior); avg_composite = 0; article_count = 0.
   * Days with articles: real FinBERT-derived values.
+  * Days with NO news article: **EXPONENTIAL DECAY** of the most recent
+    observed sentiment toward the neutral 0.5 prior (PLAN_v2 update
+    2026-05-07 per user directive). The intuition: in the absence of new
+    news, our belief about a stock's sentiment naturally fades back to
+    "no information" (= 0.5) over time. Rather than the constant-0.5
+    fill of v1 (which created an information-discontinuity at every
+    news-day boundary), we use:
+
+        s_t = 0.5 + (s_{prev} - 0.5) * exp(-lambda * delta_t)
+
+    where delta_t is the number of trading days since the last news
+    article and lambda = ln(2) / HALF_LIFE_DAYS. Default half-life is
+    5 trading days (one trading week) -- at delta_t=5 the no-news
+    sentiment is half-way back to 0.5, at delta_t=20 it is ~94% of the
+    way back. avg_composite gets analogous decay toward 0; article_count
+    remains 0.
+
+    Before any news has been observed: scaled_sentiment = 0.5 (no prior).
 
 Audit invariants per output file:
   * scaled_sentiment.std() > 0.02 (real variance, not constant 0.5)
@@ -27,6 +43,8 @@ Audit invariants per output file:
 
 Usage:
     python data_pipeline/rebuild_merged_v2.py
+    python data_pipeline/rebuild_merged_v2.py --half_life 5    # default
+    python data_pipeline/rebuild_merged_v2.py --half_life 0    # disable decay (legacy 0.5 fill)
 """
 from __future__ import annotations
 
@@ -51,8 +69,61 @@ TARGET_COLS = [
 ]
 
 
+def _apply_exponential_decay(series_values: np.ndarray,
+                              article_counts: np.ndarray,
+                              half_life: float,
+                              neutral: float = 0.5) -> np.ndarray:
+    """Impute missing daily sentiment values via exponential decay toward
+    the neutral prior.
+
+    Args
+    ----
+    series_values : 1-D array of length N. Entries on news-bearing days
+                    are real FinBERT-derived sentiment in [0, 1]; entries
+                    on no-news days are NaN.
+    article_counts : 1-D array of length N (int). >0 on news-bearing days,
+                     0 elsewhere. Used to mark the news-bearing rows
+                     (more robust than relying on NaN, since some merge
+                     paths fill NaN with 0).
+    half_life : float >= 0. Number of TRADING DAYS for sentiment to decay
+                halfway back to the neutral prior. half_life=0 disables
+                decay (returns the legacy constant-fill behaviour).
+    neutral : float, default 0.5. The decay attractor.
+
+    Returns
+    -------
+    1-D array of length N with all entries finite.
+    """
+    n = len(series_values)
+    out = np.full(n, neutral, dtype=np.float64)
+    if half_life <= 0:
+        # Legacy: constant neutral fill on no-news days; copy through the
+        # news-bearing days as-is.
+        for i in range(n):
+            if article_counts[i] > 0:
+                out[i] = float(series_values[i])
+        return out
+    lam = np.log(2.0) / half_life
+    last_observed = neutral             # before any news
+    days_since = 0
+    for i in range(n):
+        if article_counts[i] > 0:
+            # Real news today: take the FinBERT value, reset the gap clock
+            last_observed = float(series_values[i])
+            days_since = 0
+            out[i] = last_observed
+        else:
+            # No news today: decay last_observed toward neutral
+            days_since += 1
+            decay = np.exp(-lam * days_since)
+            out[i] = neutral + (last_observed - neutral) * decay
+    return out
+
+
 def merge_one(price_path: str, sent_path: str | None, out_path: str,
-              date_min: str = "2009-01-01", date_max: str = "2023-12-29") -> dict:
+              date_min: str = "2009-01-01", date_max: str = "2023-12-29",
+              half_life_sentiment: float = 5.0,
+              half_life_composite: float = 5.0) -> dict:
     # Read FNSPID prices (lower-case columns)
     prices = pd.read_csv(price_path)
     # Standardise column names to v1 schema
@@ -82,9 +153,22 @@ def merge_one(price_path: str, sent_path: str | None, out_path: str,
         sent["Date"] = pd.to_datetime(sent["Date"], utc=True, errors="coerce")
         sent = sent.dropna(subset=["Date"]).drop_duplicates(subset=["Date"])
         merged = prices.merge(sent, on="Date", how="left")
-        merged["scaled_sentiment"] = merged["scaled_sentiment"].fillna(0.5)
-        merged["avg_composite"] = merged["avg_composite"].fillna(0.0)
         merged["article_count"] = merged["article_count"].fillna(0).astype(int)
+
+        # Exponential-decay imputation (PLAN_v2 update 2026-05-07).
+        # On news-bearing days (article_count > 0) we keep the real
+        # FinBERT value; on no-news days we decay the most-recent
+        # observed value toward the neutral prior.
+        merged["scaled_sentiment"] = _apply_exponential_decay(
+            merged["scaled_sentiment"].values,
+            merged["article_count"].values,
+            half_life=half_life_sentiment, neutral=0.5,
+        )
+        merged["avg_composite"] = _apply_exponential_decay(
+            merged["avg_composite"].values,
+            merged["article_count"].values,
+            half_life=half_life_composite, neutral=0.0,
+        )
         had_sentiment = True
 
     # Ensure all target columns exist
@@ -123,6 +207,12 @@ def main():
     p.add_argument("--out_dir", default=DEFAULT_OUT_DIR)
     p.add_argument("--date_min", default="2009-01-01")
     p.add_argument("--date_max", default="2023-12-29")
+    p.add_argument("--half_life", type=float, default=5.0,
+                   help="Exponential-decay half-life in trading days for "
+                        "imputing scaled_sentiment + avg_composite on no-news "
+                        "days. 5 = sentiment is half-way back to 0.5 after 5 "
+                        "no-news days. Set to 0 to disable decay (legacy "
+                        "constant-0.5 fill).")
     p.add_argument("--strict", action="store_true")
     args = p.parse_args()
 
@@ -145,7 +235,9 @@ def main():
             continue
         r = merge_one(price_path,
                        sent_path if os.path.exists(sent_path) else None,
-                       out_path, args.date_min, args.date_max)
+                       out_path, args.date_min, args.date_max,
+                       half_life_sentiment=args.half_life,
+                       half_life_composite=args.half_life)
         rows.append(r)
         flag = "[FAIL]" if r["status"] == "fail" else "[ok]"
         sent_flag = "S" if r.get("had_sentiment") else "."
