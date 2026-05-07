@@ -30,11 +30,17 @@ class Model(nn.Module):
 
     def __init__(self, configs):
         super().__init__()
-        self.enc_in = int(getattr(configs, "enc_in", 6))
-        self.pred_len = int(getattr(configs, "pred_len", 5))
-        self.d_model = int(getattr(configs, "d_model", 128))
-        self.e_layers = int(getattr(configs, "e_layers", 2))
-        self.dropout_p = float(getattr(configs, "dropout", 0.1))
+        # Configs is a dict (matches DLinear/PatchTST/iTransformer convention).
+        # Bug fix 2026-05-07: previously used getattr() which silently fell
+        # to defaults because dicts don't expose keys as attributes -- causing
+        # pred_len to default to 5 regardless of horizon. Caused [B,5] vs
+        # [B,H] target shape mismatch for H!=5 jobs.
+        def _g(k, default): return configs.get(k, default) if isinstance(configs, dict) else getattr(configs, k, default)
+        self.enc_in = int(_g("enc_in", 6))
+        self.pred_len = int(_g("pred_len", 5))
+        self.d_model = int(_g("d_model", 128))
+        self.e_layers = int(_g("e_layers", 2))
+        self.dropout_p = float(_g("dropout", 0.1))
 
         self.input_proj = nn.Linear(self.enc_in, self.d_model)
         self.lstm = nn.LSTM(
