@@ -61,10 +61,15 @@ echo "n_jobs   : $n_jobs"
 echo "partitions (round-robin): ${PARTITIONS[*]}"
 echo
 
-read -p "Submit $n_jobs jobs? [y/N] " -r REPLY
-if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-    echo "Aborted."
-    exit 0
+# Auto-confirm path for non-interactive launches: pass YES=1 env var.
+if [ "${YES:-}" = "1" ]; then
+    echo "[YES=1] auto-confirming submission of $n_jobs jobs"
+else
+    read -p "Submit $n_jobs jobs? [y/N] " -r REPLY
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo "Aborted."
+        exit 0
+    fi
 fi
 
 mkdir -p "$HOME/logs"
