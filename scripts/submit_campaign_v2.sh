@@ -23,7 +23,7 @@ set -euo pipefail
 
 STAGE="${1:-stage1}"
 MODELS_CSV="${2:-PatchTST,TFT,GCFormer,DLinear,LSTM,RNN,CNN}"
-HORIZONS_CSV="${3:-5,20,60,120,240}"
+HORIZONS_CSV="${3:-5,20,60,120}"   # H=240 dropped (n_obs=0 in 1yr fold)
 FOLDS_CSV="${4:-F4}"
 ARMS_CSV="${5:-mse,riskhead}"
 

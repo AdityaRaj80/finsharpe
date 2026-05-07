@@ -85,18 +85,23 @@ def load_universe(file_path: str = None) -> list[str]:
 # Common training config
 # ─────────────────────────────────────────────────────────────────────────────
 SEQ_LEN = 504           # 2 trading years look-back (ratio >= 2x for all horizons)
-# All five horizons retained for the benchmark (PLAN_v2 §7 amended).
-# At long horizons, single-fold bootstrap CIs are weak (n<6 at H>=120),
-# but the 4-fold walk-forward aggregate gives n=8 at H=120 and n=4 at
-# H=240 -- borderline statistical validity reported with explicit
-# caveats. We do NOT cherry-pick horizons; we disclose the validity
-# tier of each. See reports/PLAN_v2_2026_05_07.md.
-HORIZONS = [5, 20, 60, 120, 240]
+# Horizons after Jury 2 / baseline-evidence (2026-05-08):
+#   H=240 DROPPED -- non-overlap n_obs = 0 in every 1-year fold; even
+#                    with 4-fold pooling the test panel was empty.
+#                    Confirmed empirically by baseline run 169105:
+#                    "test panel: (0, 0)" → all metrics NaN.
+#   H=120 RETAINED but DESCRIPTIVE-ONLY -- non-overlap n=1/fold, n=4
+#                    pooled. Reported as point estimate with explicit
+#                    "n too small for CI" caveat. HAC bootstrap on the
+#                    daily-overlap series provides a wide CI for
+#                    sensitivity analysis only.
+HORIZONS = [5, 20, 60, 120]
 
 # Per-horizon CI validity tier (used by cross_sectional_smoke.py +
 # bootstrap_paired.py to decide what to report):
 #   "full"      -- single-fold bootstrap CIs valid + aggregate strong
 #   "aggregate" -- single-fold CIs weak; aggregate-across-folds strong
+#                  (HAC overlap fallback usable)
 #   "point"     -- aggregate CI borderline; report point estimates,
 #                  no CI, with explicit "n too small" footnote
 HORIZON_CI_TIER = {
@@ -104,7 +109,6 @@ HORIZON_CI_TIER = {
     20:  "full",
     60:  "aggregate",
     120: "point",
-    240: "point",
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
