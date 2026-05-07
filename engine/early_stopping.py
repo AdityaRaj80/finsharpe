@@ -73,8 +73,9 @@ def adjust_learning_rate(optimizer, epoch: int, args):
         lr = args.lr if epoch < 3 else args.lr * (0.9 ** ((epoch - 3) // 1))
         _set_lr(optimizer, lr)
     elif args.lradj == "cosine":
-        warmup = int(getattr(args, "warmup_epochs", 5))
-        lr_min = float(getattr(args, "lr_min", args.lr / 100.0))
+        warmup = int(getattr(args, "warmup_epochs", 5) or 5)
+        lr_min_raw = getattr(args, "lr_min", None)
+        lr_min = float(lr_min_raw) if lr_min_raw is not None else float(args.lr) / 100.0
         if epoch <= warmup:
             # Linear warmup from lr*0.1 to lr over `warmup` epochs.
             t = max(epoch, 1) / max(warmup, 1)
