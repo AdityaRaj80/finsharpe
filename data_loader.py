@@ -122,10 +122,10 @@ def _load_stock(ticker: str, data_dir: str = None) -> StockData | None:
     # close_raw: used for log-return target. Now this is the SPLIT-ADJUSTED
     # close (because we replaced raw['Close'] with adj_factor * raw_close
     # above). Splits no longer cause artificial one-day returns.
-    # dates_int64 is np.datetime64[ns] cast to int64 (nanoseconds since epoch);
+    # dates_int64 is the int64 nanosecond representation of dates (UTC);
     # used by eval_v2 to align cross-stock panel rows by CALENDAR DATE.
-    dates_int64 = pd.to_datetime(dates, utc=True).astype("datetime64[ns]") \
-        .astype(np.int64)
+    # Use `.asi8` which works for both tz-aware and tz-naive DatetimeIndex.
+    dates_int64 = np.asarray(pd.to_datetime(dates, utc=True).asi8, dtype=np.int64)
     return StockData(ticker=ticker, dates=dates, raw=raw,
                      close_raw=raw[:, CLOSE_IDX].copy(),
                      raw_normed=None, mu=None, sd=None,
