@@ -27,7 +27,12 @@ def evaluate(model, test_loader, device, criterion=None,
         criterion = torch.nn.MSELoss()
 
     with torch.no_grad():
-        for batch_x, batch_y in test_loader:
+        for batch in test_loader:
+            # v2 loader returns (X, y_main, y_logret); legacy 2-tuple support
+            if len(batch) == 3:
+                batch_x, batch_y, _ = batch
+            else:
+                batch_x, batch_y = batch
             batch_x = batch_x.float().to(device)
             batch_y = batch_y.float().to(device)
 

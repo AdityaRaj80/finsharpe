@@ -249,12 +249,20 @@ def _fit_normalise_and_index(stk: StockData, seq_len: int, horizon: int,
 class LazyStockDataset(Dataset):
     """Memory-efficient sample-on-demand dataset.
 
-    Backing storage: a tuple (raw_normed_per_stock, close_raw_per_stock,
-    sample_table). sample_table is a [N, 3] int32 array of
-    (stock_id, start_offset, anchor_offset) where:
-        stock_id    -> index into the per-stock list
-        start_offset = i (where the input window begins)
-        anchor_offset = i + seq_len - 1 (last input day)
+    Returns 3-tuple per sample: (X, y_main, y_logret) where:
+        X         : [seq_len, F] z-scored features (float32)
+        y_main    : training target -- shape depends on target_mode
+                    'scaled_price' -> [pred_len] z-scored close window
+                    'log_return'   -> scalar log-return (matches y_logret)
+        y_logret  : scalar TRUE log-return = log(close_target / close_anchor)
+                    in raw (Adj-Close-adjusted) price space. ALWAYS provided
+                    so Track-B's CompositeRiskLoss can compute Sharpe in
+                    actual return space (Jury 2 fix item P2/E4 — was
+                    previously computing returns in z-scored space which is
+                    nonsense across stocks).
+
+    Backing storage: per-stock raw_normed (z-scored features) and close_raw
+    (Adj-Close-adjusted price scalar) arrays, plus sample_table indexing.
     """
 
     def __init__(self, raw_normed_list, close_raw_list, sample_table,
@@ -273,18 +281,22 @@ class LazyStockDataset(Dataset):
         stock_id = int(self.sample_table[idx, 0])
         i = int(self.sample_table[idx, 1])
         raw_normed = self.raw_normed_list[stock_id]
-        X = raw_normed[i : i + self.seq_len]            # [seq_len, F]
+        close = self.close_raw_list[stock_id]
+        anchor_idx = i + self.seq_len - 1
+        target_idx = i + self.seq_len + self.horizon - 1
+
+        X = raw_normed[i : i + self.seq_len].copy()      # [seq_len, F]
+        # ALWAYS compute the true log-return in raw-price space
+        y_logret = np.float32(np.log(close[target_idx] / close[anchor_idx]))
+
         if self.target_mode == "log_return":
-            close = self.close_raw_list[stock_id]
-            anchor_idx = i + self.seq_len - 1
-            target_idx = i + self.seq_len + self.horizon - 1
-            y = np.float32(np.log(close[target_idx] / close[anchor_idx]))
+            y_main = y_logret
         elif self.target_mode == "scaled_price":
-            # Return the H-step normalised close window
-            y = raw_normed[i + self.seq_len : i + self.seq_len + self.horizon, CLOSE_IDX].astype(np.float32)
+            y_main = raw_normed[i + self.seq_len :
+                                 i + self.seq_len + self.horizon, CLOSE_IDX].astype(np.float32)
         else:
             raise ValueError(f"Unknown target_mode {self.target_mode!r}")
-        return X.copy(), y
+        return X, y_main, y_logret
 
 
 # ---------------------------------------------------------------------------

@@ -3,11 +3,14 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=48G
-#SBATCH --time=06:00:00
+#SBATCH --time=12:00:00
+#SBATCH --requeue
 #SBATCH --output=/home/goyalpoonam/logs/fs_%x_%j.out
 #SBATCH --error=/home/goyalpoonam/logs/fs_%x_%j.err
 # NOTE: --partition and --qos are passed by submit_campaign_v2.sh
 # (round-robin across H100/H200/A100 to maximise concurrent throughput).
+# 12h walltime + --requeue (Jury 2 fix J3: 6h was insufficient for
+# large H + large backbone cells; SLURM auto-requeues on preempt).
 
 # Generic training submission for the dual-arm benchmark campaign.
 #

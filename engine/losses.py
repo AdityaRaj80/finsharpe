@@ -224,14 +224,21 @@ class CompositeRiskLoss(nn.Module):
         output: Dict[str, torch.Tensor],
         true_close_seq: torch.Tensor,
         log_vol_target: torch.Tensor,
+        y_logret: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """Compute composite loss.
 
         Args:
             output: dict from `RiskAwareHead.forward`, with keys
                 {mu_return_H, log_sigma2_H, log_vol_pred, last_close, ...}.
-            true_close_seq: [B, pred_len] ground-truth future close prices.
+            true_close_seq: [B, pred_len] ground-truth future close (z-scored).
             log_vol_target: [B] target log realized volatility.
+            y_logret: [B] TRUE log-return in raw price space (Jury 2 fix
+                E4: was previously deriving "returns" from z-scored close
+                differences which is meaningless across stocks). When
+                provided (v2 default), used directly for Sharpe / NLL /
+                MSE_R computation. Falling back to the z-score-derived
+                proxy if not provided keeps backward compatibility.
 
         Returns:
             (scalar loss, dict of named components for logging)
@@ -241,12 +248,17 @@ class CompositeRiskLoss(nn.Module):
         log_vol_pred: torch.Tensor = output["log_vol_pred"]          # [B]
         last_close: torch.Tensor = output["last_close"]              # [B]
 
-        # H-step ahead true return derived from the supplied close sequence.
-        # Same scaled-space floor as in RiskAwareHead so the predicted and
-        # observed returns share an identical denominator for matched samples.
-        true_close_H = true_close_seq[:, -1] if true_close_seq.ndim > 1 else true_close_seq
-        denom_true = last_close.abs().clamp(min=_RETURN_DENOM_MIN) + 1e-9
-        true_return_H = (true_close_H - last_close) / denom_true
+        # ─── True return for loss ───
+        # PREFER the externally-provided y_logret (Jury 2 fix E4 — real
+        # log-return in raw price space, comparable across stocks).
+        # Fall back to the z-scored-delta proxy only if the loader didn't
+        # provide y_logret (e.g. legacy 2-tuple loaders).
+        if y_logret is not None:
+            true_return_H = y_logret
+        else:
+            true_close_H = true_close_seq[:, -1] if true_close_seq.ndim > 1 else true_close_seq
+            denom_true = last_close.abs().clamp(min=_RETURN_DENOM_MIN) + 1e-9
+            true_return_H = (true_close_H - last_close) / denom_true
 
         # Bound log-variance for autocast stability
         log_var = log_sigma2_H.clamp(min=_LOG_VAR_MIN, max=_LOG_VAR_MAX)
@@ -271,10 +283,19 @@ class CompositeRiskLoss(nn.Module):
         position = torch.tanh(self.alpha_pos * mu_return_H / (sigma + self.eps_sigma))
 
         # ─── Gate: continuous, annealed-temperature ───
+        # Jury 2 fix E2: tau_sigma=0 (default) makes sigma_gate
+        # monotonically <= 0.5 because sigma > 0 always. The gate then
+        # collapses to ~0 as T anneals down -- the architectural
+        # contribution would be silently broken. We override tau_sigma
+        # and tau_vol to per-batch MEDIAN values so the gate distinguishes
+        # "this sample is unusually risky" from "this sample is normally
+        # risky" (relative comparison instead of absolute threshold).
         T = self.gate_temp
-        # Each sigmoid: 1 if value below threshold (low risk), 0 if above (kill)
-        gate_vol = torch.sigmoid((self.tau_vol - log_vol_pred) / (self.s_vol * T))
-        gate_sigma = torch.sigmoid((self.tau_sigma - sigma) / (self.s_sigma * T))
+        with torch.no_grad():
+            tau_sigma_eff = sigma.detach().median()
+            tau_vol_eff = log_vol_pred.detach().median()
+        gate_vol = torch.sigmoid((tau_vol_eff - log_vol_pred) / (self.s_vol * T))
+        gate_sigma = torch.sigmoid((tau_sigma_eff - sigma) / (self.s_sigma * T))
         gate = gate_vol * gate_sigma                                 # [B], in [0, 1]
 
         # ─── L_SR_gated: per-batch differentiable Sharpe of GATED returns ───

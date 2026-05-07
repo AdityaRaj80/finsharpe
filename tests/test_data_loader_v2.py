@@ -171,18 +171,25 @@ def test_t6_no_nan_inf(smoke_loader):
 
 
 def test_t7_dataloader_iteration(smoke_loader):
-    """One full pass through the train DataLoader. Target shape depends
-    on TARGET_MODE: [B] for log_return, [B, pred_len] for scaled_price."""
+    """One full pass through the train DataLoader. v2 returns 3-tuple
+    (X, y_main, y_logret). y_main shape depends on TARGET_MODE; y_logret
+    is always [B] scalar log-return."""
     loader = smoke_loader.get_train_loader(shuffle=False)
     n_samples = 0
-    for X, y in loader:
+    for batch in loader:
+        assert len(batch) == 3, "expected 3-tuple (X, y_main, y_logret)"
+        X, y_main, y_logret = batch
         assert isinstance(X, torch.Tensor)
         assert X.shape[1] == 96
         assert X.shape[2] == len(FEATURES)
         if smoke_loader.target_mode == "log_return":
-            assert y.shape == (X.shape[0],)
+            assert y_main.shape == (X.shape[0],)
         else:
-            assert y.shape == (X.shape[0], smoke_loader.horizon)
+            assert y_main.shape == (X.shape[0], smoke_loader.horizon)
+        # y_logret is always a [B] scalar
+        assert y_logret.shape == (X.shape[0],)
+        # y_logret values are reasonable for daily-scale log-returns
+        assert torch.isfinite(y_logret).all()
         n_samples += X.shape[0]
     assert n_samples == len(smoke_loader.X_train)
 

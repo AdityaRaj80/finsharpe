@@ -69,8 +69,19 @@ class Trainer:
         self.optimizer = AdamW(self.model.parameters(), lr=args.lr)
 
     # ────────────────────────────────────────────────────────────── helpers
-    def _forward_loss(self, batch_x: torch.Tensor, batch_y: torch.Tensor):
+    def _forward_loss(self, batch_x: torch.Tensor, batch_y: torch.Tensor,
+                       y_logret: torch.Tensor | None = None):
         """Single forward + loss eval, branching on training mode.
+
+        Args:
+            batch_x  : [B, seq_len, F] z-scored features
+            batch_y  : training-mode-specific target (z-scored close window
+                       for 'scaled_price' mode, scalar log-return for
+                       'log_return' mode)
+            y_logret : [B] TRUE log-return scalar (always provided by v2
+                       data loader). Used by Track-B's composite loss for
+                       Sharpe / NLL computation in actual return space
+                       (Jury 2 fix item E4).
 
         Returns
         -------
@@ -79,18 +90,23 @@ class Trainer:
         """
         outputs = self.model(batch_x, None)
         if self.use_risk_head:
-            # RiskAwareHead returns a dict; we additionally need a per-batch
-            # log-vol target derived from batch_y. last_close is taken from
-            # the model's own output dict (matches the head's view of x_enc).
             assert isinstance(outputs, dict), (
                 "use_risk_head=True but model output is not a dict. "
                 "Wrap the backbone in engine.heads.RiskAwareHead."
             )
+            # Compute log-vol target from raw log-returns OR from the
+            # input window's close stride (better signal). For now use
+            # batch_y if it's a price window (scaled_price target), else
+            # use a per-batch zero proxy + the y_logret std.
             last_close = outputs.get("last_close")
-            log_vol_target = _compute_log_vol_target(batch_y, last_close=last_close)
-            loss, parts = self.criterion(outputs, batch_y, log_vol_target)
+            log_vol_target = _compute_log_vol_target(
+                batch_y if batch_y.dim() > 1 else batch_y.unsqueeze(1),
+                last_close=last_close,
+            )
+            loss, parts = self.criterion(outputs, batch_y, log_vol_target,
+                                          y_logret=y_logret)
             return loss, parts
-        # Legacy path: tensor outputs, single MSE.
+        # MSE arm: standard MSE on z-scored close window.
         if isinstance(outputs, tuple):
             if self.args.model_name == 'AdaPatch':
                 pred, orig, dec = outputs
@@ -110,32 +126,40 @@ class Trainer:
         train_loss = []
         accum_parts: dict[str, list] = {}
 
-        for batch_x, batch_y in train_loader:
+        for batch in train_loader:
+            # v2 loader returns (X, y_main, y_logret); legacy 2-tuple support
+            # for back-compat with old caches / tests.
+            if len(batch) == 3:
+                batch_x, batch_y, y_logret = batch
+                y_logret = y_logret.float().to(self.device)
+            else:
+                batch_x, batch_y = batch
+                y_logret = None
             self.optimizer.zero_grad()
             batch_x = batch_x.float().to(self.device)
             batch_y = batch_y.float().to(self.device)
 
             if self.args.use_amp:
                 device_type = 'cuda' if self.device.type == 'cuda' else 'cpu'
-                # Use bf16 on Ampere+ GPUs (compute capability >= 8.0: A100, H100, H200, RTX 30xx+).
-                # bf16 has the same dynamic range as fp32 (8-bit exponent), so it does NOT overflow
-                # in transformer attention softmax — the failure mode that caused iTransformer
-                # sequential training to NaN under fp16 AMP. fp16 fallback is kept for older GPUs.
-                if self.device.type == 'cuda' and torch.cuda.get_device_capability(self.device)[0] >= 8:
-                    amp_dtype = torch.bfloat16
-                else:
-                    amp_dtype = torch.float16
-                with torch.autocast(device_type=device_type, dtype=amp_dtype):
-                    loss, parts = self._forward_loss(batch_x, batch_y)
-
-                loss.backward()  # Should use GradScaler for full AMP, but simplified here
-                self.optimizer.step()
-            else:
-                loss, parts = self._forward_loss(batch_x, batch_y)
-
+                # bf16 only -- A100/H100/H200 all support it natively. fp16
+                # fallback removed (Jury 2 fix D1: dead code under campaign).
+                if not (self.device.type == 'cuda'
+                         and torch.cuda.get_device_capability(self.device)[0] >= 8):
+                    raise RuntimeError(
+                        "use_amp requires an Ampere+ GPU (A100/H100/H200). "
+                        "Older GPUs would need fp16+GradScaler which is not "
+                        "wired up in v2 (would silently underflow gradients).")
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    loss, parts = self._forward_loss(batch_x, batch_y, y_logret)
                 loss.backward()
-                nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                self.optimizer.step()
+            else:
+                loss, parts = self._forward_loss(batch_x, batch_y, y_logret)
+                loss.backward()
+
+            # Gradient clipping ALWAYS applied (Jury 2 fix D2: was previously
+            # skipped under AMP path -- the entire campaign was unclamped).
+            nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.optimizer.step()
 
             train_loss.append(loss.item())
             for k, v in parts.items():

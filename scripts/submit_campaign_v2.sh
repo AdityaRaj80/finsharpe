@@ -41,11 +41,12 @@ IFS=',' read -ra FOLDS <<<"$FOLDS_CSV"
 IFS=',' read -ra ARMS <<<"$ARMS_CSV"
 
 # Round-robin partition pool (paired with QOS).
-# Order matters: index 0 is the first one assigned, index 1 second, etc.
-# Larger VRAM (H200 141GB > H100 80GB > A100 80GB) gets bigger batch.
+# Jury 2 fix C1: BATCH_SIZE held constant across partitions for cross-cell
+# reproducibility. Larger H200 VRAM is left as headroom (we could use it
+# for more concurrent jobs but NOT for varying bs within the same campaign).
 PARTITIONS=("gpu_h100_4"     "gpu_h200_8"     "gpu_a100_8")
 QOSES=(      "qos_gpu_h100"  "qos_gpu_h200"   "qos_gpu_a100")
-BATCH_SIZES=("512"           "768"            "512")
+BATCH_SIZE_FIXED=512
 
 n_jobs=$((${#MODELS[@]} * ${#HORIZONS[@]} * ${#FOLDS[@]} * ${#ARMS[@]}))
 
@@ -77,17 +78,24 @@ for MODEL in "${MODELS[@]}"; do
                 p_idx=$((rr_idx % ${#PARTITIONS[@]}))
                 PART="${PARTITIONS[$p_idx]}"
                 QOS="${QOSES[$p_idx]}"
-                BS="${BATCH_SIZES[$p_idx]}"
                 jname="${MODEL}_H${H}_${FOLD}_${ARM}"
+
+                # Jury 2 fix J1: skip if checkpoint already exists (resume safety)
+                ckpt="$HOME/finsharpe/checkpoints/${MODEL}_global_H${H}_${FOLD}_${ARM}.pth"
+                if [ -f "$ckpt" ] && [ -z "${FORCE:-}" ]; then
+                    echo "  [skip] $jname  (checkpoint exists; FORCE=1 to override)"
+                    rr_idx=$((rr_idx + 1))
+                    continue
+                fi
 
                 jid=$(sbatch --parsable \
                     --partition="$PART" \
                     --qos="$QOS" \
                     --job-name="$jname" \
-                    --export=ALL,MODEL="$MODEL",HORIZON="$H",FOLD="$FOLD",ARM="$ARM",BATCH_SIZE="$BS" \
+                    --export=ALL,MODEL="$MODEL",HORIZON="$H",FOLD="$FOLD",ARM="$ARM",BATCH_SIZE="$BATCH_SIZE_FIXED" \
                     scripts/train_campaign.sbatch)
                 submitted=$((submitted + 1))
-                echo "[$submitted/$n_jobs] $jname  partition=$PART  bs=$BS  jobid=$jid"
+                echo "[$submitted/$n_jobs] $jname  partition=$PART  bs=$BATCH_SIZE_FIXED  jobid=$jid"
                 rr_idx=$((rr_idx + 1))
             done
         done

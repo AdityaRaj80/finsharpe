@@ -56,19 +56,34 @@ class RiskAwareHead(nn.Module):
 
         in_dim = self.lookback * int(n_features)
 
-        # Sigma head — outputs log_sigma2 of the H-step return (one scalar / sample).
+        # Sigma head — outputs log_sigma2 of the H-step LOG-RETURN.
         self.sigma_head = nn.Sequential(
             nn.Linear(in_dim, d_hidden),
             nn.GELU(),
             nn.Linear(d_hidden, 1),
         )
 
-        # Vol head — outputs predicted forward log realized vol (one scalar / sample).
+        # Vol head — outputs predicted forward log realized vol.
         self.vol_head = nn.Sequential(
             nn.Linear(in_dim, d_hidden),
             nn.GELU(),
             nn.Linear(d_hidden, 1),
         )
+
+        # Return head (Jury 2 fix E4 / P2, 2026-05-07): maps backbone's
+        # [pred_len] z-scored close-prediction to a scalar predicted
+        # H-step LOG-RETURN. Learned linear projection. Without this,
+        # mu_return_H lives in z-score-delta space which is not
+        # comparable to the externally-provided y_logret in real return
+        # space; L_NLL and L_MSE_R would have mismatched units.
+        self.return_head = nn.Linear(self.pred_len, 1)
+        # Initialise the return head to roughly extract the last z-score
+        # delta as a small return -- a reasonable inductive bias.
+        with torch.no_grad():
+            w = torch.zeros(1, self.pred_len)
+            w[0, -1] = 0.01     # last-step weight is small (~per-sd return scale)
+            self.return_head.weight.copy_(w)
+            self.return_head.bias.zero_()
 
     def forward(self, x_enc: torch.Tensor, x_mark_enc=None):
         """Forward pass.
@@ -98,22 +113,17 @@ class RiskAwareHead(nn.Module):
         # Final-step prediction
         mu_close_H = mu_close[:, -1]                                     # [B]
 
-        last_close = x_enc[:, -1, self.close_idx]                        # [B]
+        last_close = x_enc[:, -1, self.close_idx]                        # [B] z-scored anchor
 
-        # H-step predicted return.
-        # NOTE: features are MinMax-scaled per stock to [0, 1] before training,
-        # so `last_close` lives in scaled space, NOT in dollars. For samples
-        # near a stock's historical minimum the scaled close approaches 0 and
-        # `(mu - last) / |last|` would explode. We floor |last_close| at
-        # `_RETURN_DENOM_MIN` (1% of MinMax range) so the scaled-space return is
-        # numerically bounded. This is a structural approximation: the
-        # downstream Sharpe / NLL / position-sizing terms only need a *signed,
-        # scale-stable* return signal, which this provides. Semantic
-        # dollar-space returns require threading close_min/close_max through
-        # the loss path — left for a follow-up if the floor proves too coarse.
-        _RETURN_DENOM_MIN = 1e-2
-        denom = last_close.abs().clamp(min=_RETURN_DENOM_MIN) + 1e-9
-        mu_return_H = (mu_close_H - last_close) / denom                  # [B]
+        # H-step predicted log-return (Jury 2 fix E4 / P2):
+        # We map the backbone's [pred_len] z-scored close prediction to a
+        # SCALAR LOG-RETURN via a learned linear projection (return_head).
+        # The projection is initialised to extract a small last-step delta
+        # (reasonable inductive bias); end-to-end training under
+        # CompositeRiskLoss + true y_logret target shapes it correctly.
+        # Output is in REAL LOG-RETURN units, comparable to the externally-
+        # provided y_logret from the data loader.
+        mu_return_H = self.return_head(mu_close).squeeze(-1)             # [B] log-return
 
         # Auxiliary heads on last `lookback` rows
         last_window = x_enc[:, -self.lookback:, :]                       # [B, L, F]

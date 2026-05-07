@@ -232,12 +232,21 @@ def main():
         "test_mae":  float(test_metrics.get("mae", float("nan"))),
         "ckpt_path": save_path,
     }
-    df = pd.DataFrame([row])
+    # Jury 2 fix H1: CSV append now de-duplicates on (model, horizon, fold,
+    # arm, seed). Re-running a cell overwrites the previous row instead of
+    # appending a duplicate (which would silently double-count in any
+    # downstream groupby).
+    new_df = pd.DataFrame([row])
     if os.path.exists(res_path):
-        df.to_csv(res_path, mode="a", header=False, index=False)
+        existing = pd.read_csv(res_path)
+        key = ["model", "horizon", "fold", "arm", "seed"]
+        existing = existing[~existing.set_index(key).index.isin(
+            new_df.set_index(key).index)]
+        out_df = pd.concat([existing, new_df], ignore_index=True)
     else:
-        df.to_csv(res_path, index=False)
-    print(f"[v2] result row appended -> {res_path}")
+        out_df = new_df
+    out_df.to_csv(res_path, index=False)
+    print(f"[v2] result row written -> {res_path}")
     print(json.dumps(row, indent=2))
 
 
