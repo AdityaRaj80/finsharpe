@@ -90,12 +90,14 @@ SEQ_LEN = 504           # 2 trading years look-back (ratio >= 2x for all horizon
 #                    with 4-fold pooling the test panel was empty.
 #                    Confirmed empirically by baseline run 169105:
 #                    "test panel: (0, 0)" → all metrics NaN.
-#   H=120 RETAINED but DESCRIPTIVE-ONLY -- non-overlap n=1/fold, n=4
-#                    pooled. Reported as point estimate with explicit
-#                    "n too small for CI" caveat. HAC bootstrap on the
-#                    daily-overlap series provides a wide CI for
-#                    sensitivity analysis only.
-HORIZONS = [5, 20, 60, 120]
+#   H=120 DROPPED from ML training campaign (2026-05-08): n_val=0 in
+#                    most folds after embargo (504 lookback + 120 horizon
+#                    consumes the entire 1-year val window). Empirically
+#                    confirmed: 8/8 CNN H=120 jobs failed with empty val
+#                    loader. Baselines still produced H=120 entries
+#                    (parameter-free; no val needed) and those summaries
+#                    are retained for descriptive reporting only.
+HORIZONS = [5, 20, 60]
 
 # Per-horizon CI validity tier (used by cross_sectional_smoke.py +
 # bootstrap_paired.py to decide what to report):

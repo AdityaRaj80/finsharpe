@@ -68,13 +68,23 @@ def evaluate(model, test_loader, device, criterion=None,
             preds.append(pred.detach().cpu().numpy())
             trues.append(target.detach().cpu().numpy())
 
+    # Guard against empty loader (e.g. n_val=0 at H=120 after embargo —
+    # can happen on 1-year folds with long horizons). Return NaN metrics
+    # so trainer can keep going without crashing; early stopping then
+    # never receives an improvement signal and falls back to last-epoch.
+    if not preds:
+        return {
+            "loss": float("nan"),
+            "mse": float("nan"), "mae": float("nan"),
+            "rmse": float("nan"), "r2": float("nan"),
+        }
     preds = np.concatenate(preds, axis=0)
     trues = np.concatenate(trues, axis=0)
 
     mae, mse, rmse, r2 = metric(preds, trues)
 
     result = {
-        "loss": total_loss / len(test_loader),
+        "loss": total_loss / max(len(test_loader), 1),
         "mse": mse,
         "mae": mae,
         "rmse": rmse,
