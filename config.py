@@ -34,8 +34,17 @@ os.makedirs(VALTEST_CACHE_DIR, exist_ok=True)
 # ─────────────────────────────────────────────────────────────────────────────
 # Data / Feature config
 # ─────────────────────────────────────────────────────────────────────────────
-FEATURES = ["Open", "High", "Low", "Close", "Volume", "scaled_sentiment"]
-CLOSE_IDX = 3  # Index of Close in FEATURES array
+# Feature set (Alpha158-lite, 2026-05-09).
+# The first 6 are the original raw features (OHLCV + scaled_sentiment) — the
+# raw OHLC is Adj-Close-adjusted in the data loader and Volume is log1p'd.
+# CLOSE_IDX = 3 points to "Close" so all downstream code (heads, eval_v2,
+# trainer log_vol_target) keeps working without changes.
+# The remaining 63 are Qlib Alpha158-lite features computed per-stock during
+# data load (see data_pipeline/alpha_features.py for the full list and
+# Yang et al. 2020 arXiv:2009.11189 for the canonical Alpha158).
+from data_pipeline.alpha_features import ALL_FEATURE_NAMES as _ALL_FEAT
+FEATURES = list(_ALL_FEAT)
+CLOSE_IDX = 3  # Index of Close in FEATURES array (raw OHLC[Volume,sentiment] block first)
 
 # Target convention (PLAN_v2):
 #   "scaled_price": [pred_len] z-scored close window. The MSE arm uses

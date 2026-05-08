@@ -101,7 +101,17 @@ def _load_stock(ticker: str, data_dir: str = None) -> StockData | None:
         if col in df.columns:
             df[col] = df[col].astype(np.float64).values * adj_factor
 
-    # ----- F-G: log1p Volume -----
+    # ----- Alpha158-lite features -----
+    # Compute the Qlib-style alpha feature set BEFORE log1p'ing Volume so
+    # rolling volume statistics (VMA, VSTD) work on the natural shares-traded
+    # scale. The function adds ~63 new columns; the 6 raw columns (OHLCV +
+    # scaled_sentiment) are preserved.
+    from data_pipeline.alpha_features import compute_alpha_features
+    if "scaled_sentiment" not in df.columns:
+        df["scaled_sentiment"] = 0.5
+    df = compute_alpha_features(df)
+
+    # ----- F-G: log1p Volume (after alpha feature compute) -----
     if "Volume" in df.columns:
         df["Volume"] = np.log1p(df["Volume"].astype(np.float64).clip(lower=0).values)
 
