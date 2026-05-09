@@ -46,7 +46,7 @@ IFS=',' read -ra ARMS <<<"$ARMS_CSV"
 # for more concurrent jobs but NOT for varying bs within the same campaign).
 PARTITIONS=("gpu_h100_4"     "gpu_h200_8"     "gpu_a100_8")
 QOSES=(      "qos_gpu_h100"  "qos_gpu_h200"   "qos_gpu_a100")
-BATCH_SIZE_FIXED=512
+BATCH_SIZE_FIXED="${BATCH_SIZE_FIXED:-512}"  # default 512; can be overridden via env
 
 n_jobs=$((${#MODELS[@]} * ${#HORIZONS[@]} * ${#FOLDS[@]} * ${#ARMS[@]}))
 
