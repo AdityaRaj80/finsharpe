@@ -19,11 +19,15 @@ class Model(nn.Module):
         
         # We wrap the config dict into a fake Namespace so layers/ components which expect args don't fail
         args = Namespace(**configs)
-        setattr(args, "enc_in", 6)
+        # Jury fix (2026-05-09): respect configs['enc_in'] so the model
+        # works with the Alpha158-lite 69-feature input. Previously hardcoded
+        # to 6, breaking training on richer feature sets.
+        _enc_in = int(configs.get('enc_in', 6))
+        setattr(args, "enc_in", _enc_in)
         setattr(args, "seq_len", configs.get('context_len', 504))
         setattr(args, "batch_size", 128)
-        
-        c_in = 6
+
+        c_in = _enc_in
         n_layers = configs['e_layers']
         n_heads = configs['n_heads']
         d_model = configs['d_model']
@@ -42,7 +46,7 @@ class Model(nn.Module):
         
         self.context_window = configs['context_len']
         self.batch_size = 128
-        self.enc_in = 6
+        self.enc_in = _enc_in
         self.context_len = configs['context_len']
         self.pred_len = configs['pred_len']
         self.seq_len = configs.get('context_len', 504)
