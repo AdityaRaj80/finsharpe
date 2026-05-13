@@ -13,7 +13,7 @@
 # Total job count per model = 5 (H=5,20,60,120,240).
 
 set -e
-cd ~/SR_optimization
+cd /scratch/goyalpoonam/finsharpe
 
 if [[ $# -lt 1 ]]; then
     echo "usage: $0 <MODEL>... | ALL"

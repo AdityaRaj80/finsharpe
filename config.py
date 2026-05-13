@@ -15,8 +15,6 @@ if os.path.exists(r"D:\Study\CIKM\fin-sent-optimized\data\merged_v3"):
     DATA_DIR = r"D:\Study\CIKM\fin-sent-optimized\data\merged_v3"
 elif os.path.exists("/scratch/goyalpoonam/finsharpe/data/merged_v3"):
     DATA_DIR = "/scratch/goyalpoonam/finsharpe/data/merged_v3"
-elif os.path.exists("/home/goyalpoonam/data/merged_v3"):
-    DATA_DIR = "/home/goyalpoonam/data/merged_v3"
 else:
     DATA_DIR = None    # Set later by pipelines that don't need merged data yet
                        # (e.g., the FinBERT scoring step itself).

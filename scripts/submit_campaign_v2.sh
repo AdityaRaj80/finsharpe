@@ -72,7 +72,7 @@ else
     fi
 fi
 
-mkdir -p "$HOME/logs"
+mkdir -p /scratch/goyalpoonam/logs
 
 submitted=0
 rr_idx=0
@@ -86,7 +86,7 @@ for MODEL in "${MODELS[@]}"; do
                 jname="${MODEL}_H${H}_${FOLD}_${ARM}"
 
                 # Jury 2 fix J1: skip if checkpoint already exists (resume safety)
-                ckpt="$HOME/finsharpe/checkpoints/${MODEL}_global_H${H}_${FOLD}_${ARM}.pth"
+                ckpt="/scratch/goyalpoonam/finsharpe/checkpoints/${MODEL}_global_H${H}_${FOLD}_${ARM}.pth"
                 if [ -f "$ckpt" ] && [ -z "${FORCE:-}" ]; then
                     echo "  [skip] $jname  (checkpoint exists; FORCE=1 to override)"
                     rr_idx=$((rr_idx + 1))

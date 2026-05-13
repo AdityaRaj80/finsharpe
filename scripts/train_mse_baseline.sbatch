@@ -4,8 +4,8 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --exclude=gpunode5
-#SBATCH --output=/home/goyalpoonam/logs/%x_%j.out
-#SBATCH --error=/home/goyalpoonam/logs/%x_%j.err
+#SBATCH --output=/scratch/goyalpoonam/logs/%x_%j.out
+#SBATCH --error=/scratch/goyalpoonam/logs/%x_%j.err
 # MSE-baseline FROM-SCRATCH training on the sentiment-corrected dataset.
 # This is the "with-sentiment" arm of the headline ablation:
 #   no-sentiment baseline  = the v1 fan-out already complete on HPC
@@ -42,7 +42,7 @@ echo "MODEL=$MODEL  H=$H  EPOCHS=$EPOCHS  BATCH=$BATCH  LR=$LR"
 source /apps/spack/opt/spack/linux-rocky8-zen2/gcc-11.2.0/anaconda3-2023.09-0-ku6kdpolxwbdydg5xyawasvogquyjj4b/etc/profile.d/conda.sh
 conda activate sr_opt
 
-cd ~/finsharpe
+cd /scratch/goyalpoonam/finsharpe
 
 # Pre-flight: cache must exist + audit must pass. Catches the v0 incident.
 python data_pipeline/audit.py cache 2>&1 | tail -5 || {

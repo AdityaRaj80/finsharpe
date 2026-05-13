@@ -6,8 +6,8 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=03:00:00
-#SBATCH --output=/home/goyalpoonam/logs/finbert_score_%j.out
-#SBATCH --error=/home/goyalpoonam/logs/finbert_score_%j.err
+#SBATCH --output=/scratch/goyalpoonam/logs/finbert_score_%j.out
+#SBATCH --error=/scratch/goyalpoonam/logs/finbert_score_%j.err
 
 # FinBERT inference on the 300-stock filtered news subset (~1.26M articles).
 # Expected wall-clock on H100 80GB: 10-20 minutes.
@@ -21,10 +21,10 @@ echo "[$(date)] node=$(hostname) job=$SLURM_JOB_ID"
 echo "[$(date)] gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
 
 # Paths (HPC layout)
-REPO_DIR="$HOME/finsharpe"
-NEWS_FILE="$HOME/data/filtered_news_universe_main.csv"
-OUT_DIR="$HOME/data/finbert_scores_v2"
-HF_CACHE="$HOME/.cache/huggingface"
+REPO_DIR="/scratch/goyalpoonam/finsharpe"
+NEWS_FILE="/scratch/goyalpoonam/finsharpe/data/filtered_news_universe_main.csv"
+OUT_DIR="/scratch/goyalpoonam/finsharpe/data/finbert_scores_v2"
+HF_CACHE="/scratch/goyalpoonam/hf_cache"
 
 cd "$REPO_DIR"
 

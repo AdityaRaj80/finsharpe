@@ -16,7 +16,7 @@
 #   bash scripts/submit_full_campaign.sh riskhead      GCFormer
 
 set -e
-cd ~/finsharpe
+cd /scratch/goyalpoonam/finsharpe
 
 if [[ $# -lt 2 ]]; then
     echo "usage: $0 <mse|riskhead> <MODEL>... | ALL"

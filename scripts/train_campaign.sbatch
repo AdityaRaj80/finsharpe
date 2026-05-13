@@ -5,8 +5,8 @@
 #SBATCH --mem=48G
 #SBATCH --time=24:00:00
 #SBATCH --requeue
-#SBATCH --output=/home/goyalpoonam/logs/fs_%x_%j.out
-#SBATCH --error=/home/goyalpoonam/logs/fs_%x_%j.err
+#SBATCH --output=/scratch/goyalpoonam/logs/fs_%x_%j.out
+#SBATCH --error=/scratch/goyalpoonam/logs/fs_%x_%j.err
 # NOTE: --partition and --qos are passed by submit_campaign_v2.sh
 # (round-robin across H100/H200/A100 to maximise concurrent throughput).
 # 12h walltime + --requeue (Jury 2 fix J3: 6h was insufficient for
@@ -25,7 +25,7 @@
 
 set -euo pipefail
 
-REPO_DIR="$HOME/finsharpe"
+REPO_DIR="/scratch/goyalpoonam/finsharpe"
 cd "$REPO_DIR"
 
 # Activate sr_opt conda env (verified torch 2.11+cu130, transformers 5.8)

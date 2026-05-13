@@ -4,8 +4,8 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --exclude=gpunode5
-#SBATCH --output=/home/goyalpoonam/logs/%x_%j.out
-#SBATCH --error=/home/goyalpoonam/logs/%x_%j.err
+#SBATCH --output=/scratch/goyalpoonam/logs/%x_%j.out
+#SBATCH --error=/scratch/goyalpoonam/logs/%x_%j.err
 # Track B (Sharpe-loss + risk-aware head) fine-tune from a pre-trained MSE
 # checkpoint. One job = one (MODEL, HORIZON) pair.
 #
@@ -40,7 +40,7 @@ echo "MODEL=$MODEL H=$H EPOCHS=$EPOCHS BATCH=$BATCH LR=$LR INIT_CKPT=$INIT_CKPT"
 source $(dirname $(dirname $(which conda)))/etc/profile.d/conda.sh
 conda activate sr_opt
 
-cd ~/SR_optimization
+cd /scratch/goyalpoonam/finsharpe
 
 # Sanity: init checkpoint must exist (we run with --init_from). If it does
 # not, fail fast — there is no MSE baseline to fine-tune from.
