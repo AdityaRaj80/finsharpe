@@ -10,8 +10,11 @@ import pandas as pd
 #   3. data_pipeline/rebuild_merged_v2.py
 #
 # Local + HPC fallback paths.
+# HPC: prefer /scratch (unlimited quota; ~/data was retired 2026-05-10).
 if os.path.exists(r"D:\Study\CIKM\fin-sent-optimized\data\merged_v3"):
     DATA_DIR = r"D:\Study\CIKM\fin-sent-optimized\data\merged_v3"
+elif os.path.exists("/scratch/goyalpoonam/finsharpe/data/merged_v3"):
+    DATA_DIR = "/scratch/goyalpoonam/finsharpe/data/merged_v3"
 elif os.path.exists("/home/goyalpoonam/data/merged_v3"):
     DATA_DIR = "/home/goyalpoonam/data/merged_v3"
 else:
